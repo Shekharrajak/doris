@@ -19,12 +19,10 @@
 
 #include <librdkafka/rdkafka.h>
 
-#include "core/custom_allocator.h"
 #include "load/routine_load/data_consumer.h"
+#include "load/routine_load/kafka_share_batch.h"
 
 namespace doris {
-
-class MemTrackerLimiter;
 
 class KafkaShareConsumer : public DataConsumer {
 public:
@@ -44,12 +42,9 @@ protected:
 
 private:
     Status acknowledge(bool committed);
-    void reserve_records(size_t count);
 
-    std::shared_ptr<MemTrackerLimiter> _mem_tracker;
     rd_kafka_share_t* _consumer = nullptr;
-    DorisVector<std::pair<int32_t, int64_t>> _records;
-    size_t _processed = 0;
+    KafkaShareBatch _batch;
     bool _reusable = true;
     std::string _brokers;
     std::string _topic;

@@ -63,9 +63,10 @@ public:
 
     Status consume(std::shared_ptr<StreamLoadContext> ctx) override {
         _ctx = ctx;
-        reserve_records(2);
-        _records = {{0, 100}, {1, 50}};
-        _processed = 1;
+        _batch.reserve(2);
+        _batch.add_record(0, 100);
+        _batch.add_record(1, 50);
+        _batch.mark_processed();
         if (fail_consume) {
             return Status::InternalError("share consume failed");
         }
