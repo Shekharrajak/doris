@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 
+#include <initializer_list>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -27,6 +28,19 @@
 #include "runtime/thread_context.h"
 
 namespace doris {
+
+namespace {
+void prepare_batch(KafkaShareBatch& batch, std::initializer_list<KafkaShareBatch::Record> records,
+                   size_t processed) {
+    batch.reserve(records.size());
+    for (const auto& record : records) {
+        batch.add_record(record.first, record.second);
+    }
+    for (size_t i = 0; i < processed; ++i) {
+        batch.mark_processed();
+    }
+}
+} // namespace
 
 class RecordingShareConsumer : public KafkaShareConsumer {
 public:
@@ -52,9 +66,7 @@ protected:
 
 TEST(KafkaShareConsumerTest, CommitAcceptsOnlyWrittenRecords) {
     RecordingShareConsumer consumer;
-    consumer.reserve_records(3);
-    consumer._records = {{0, 101}, {0, 100}, {1, 50}};
-    consumer._processed = 2;
+    prepare_batch(consumer._batch, {{0, 101}, {0, 100}, {1, 50}}, 2);
     EXPECT_FALSE(consumer.reset().ok());
     ASSERT_TRUE(consumer.acknowledge_committed().ok());
     EXPECT_EQ(consumer.acknowledgements, (std::vector<std::tuple<int32_t, int64_t, bool>> {
@@ -65,9 +77,7 @@ TEST(KafkaShareConsumerTest, CommitAcceptsOnlyWrittenRecords) {
 
 TEST(KafkaShareConsumerTest, AbortReleasesEveryRecord) {
     RecordingShareConsumer consumer;
-    consumer.reserve_records(2);
-    consumer._records = {{0, 100}, {0, 101}};
-    consumer._processed = 1;
+    prepare_batch(consumer._batch, {{0, 100}, {0, 101}}, 1);
     ASSERT_TRUE(consumer.cancel(nullptr).ok());
     EXPECT_EQ(consumer.acknowledgements,
               (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 100, false}, {0, 101, false}}));
@@ -76,9 +86,7 @@ TEST(KafkaShareConsumerTest, AbortReleasesEveryRecord) {
 
 TEST(KafkaShareConsumerTest, Completing101DoesNotAccept100) {
     RecordingShareConsumer consumer;
-    consumer.reserve_records(2);
-    consumer._records = {{0, 101}, {0, 100}};
-    consumer._processed = 1;
+    prepare_batch(consumer._batch, {{0, 101}, {0, 100}}, 1);
     ASSERT_TRUE(consumer.acknowledge_committed().ok());
     EXPECT_EQ(consumer.acknowledgements,
               (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 101, true}, {0, 100, false}}));
@@ -86,20 +94,16 @@ TEST(KafkaShareConsumerTest, Completing101DoesNotAccept100) {
 
 TEST(KafkaShareConsumerTest, FailedAcknowledgementCannotBeReused) {
     RecordingShareConsumer consumer;
-    consumer.reserve_records(1);
-    consumer._records = {{0, 100}};
-    consumer._processed = 1;
+    prepare_batch(consumer._batch, {{0, 100}}, 1);
     consumer.fail_commit = true;
     EXPECT_FALSE(consumer.acknowledge_committed().ok());
     EXPECT_FALSE(consumer.reset().ok());
-    EXPECT_TRUE(consumer._records.empty());
+    EXPECT_TRUE(consumer._batch.empty());
 }
 
 TEST(KafkaShareConsumerTest, ExpiredAcquisitionCannotBeReused) {
     RecordingShareConsumer consumer;
-    consumer.reserve_records(1);
-    consumer._records = {{0, 100}};
-    consumer._processed = 1;
+    prepare_batch(consumer._batch, {{0, 100}}, 1);
     consumer.fail_record = true;
     EXPECT_FALSE(consumer.acknowledge_committed().ok());
     EXPECT_EQ(consumer.commits, 0);
@@ -108,9 +112,7 @@ TEST(KafkaShareConsumerTest, ExpiredAcquisitionCannotBeReused) {
 
 TEST(KafkaShareConsumerTest, ExpiredAcquisitionDoesNotStrandCommittedRecords) {
     RecordingShareConsumer consumer;
-    consumer.reserve_records(3);
-    consumer._records = {{0, 100}, {1, 50}, {2, 75}};
-    consumer._processed = 2;
+    prepare_batch(consumer._batch, {{0, 100}, {1, 50}, {2, 75}}, 2);
     consumer.fail_offset = 100;
     EXPECT_FALSE(consumer.acknowledge_committed().ok());
     EXPECT_EQ(consumer.acknowledgements,
@@ -121,9 +123,7 @@ TEST(KafkaShareConsumerTest, ExpiredAcquisitionDoesNotStrandCommittedRecords) {
 
 TEST(KafkaShareConsumerTest, ExpiredAcquisitionDoesNotStrandReleasedRecords) {
     RecordingShareConsumer consumer;
-    consumer.reserve_records(3);
-    consumer._records = {{0, 100}, {1, 50}, {2, 75}};
-    consumer._processed = 2;
+    prepare_batch(consumer._batch, {{0, 100}, {1, 50}, {2, 75}}, 2);
     consumer.fail_offset = 100;
     EXPECT_FALSE(consumer.cancel(nullptr).ok());
     EXPECT_EQ(consumer.acknowledgements,
@@ -135,24 +135,46 @@ TEST(KafkaShareConsumerTest, ExpiredAcquisitionDoesNotStrandReleasedRecords) {
 TEST(KafkaShareConsumerTest, EmptyBatchDoesNotCommitAcknowledgements) {
     RecordingShareConsumer consumer;
     EXPECT_TRUE(consumer.acknowledge_committed().ok());
+    EXPECT_TRUE(consumer.cancel(nullptr).ok());
     EXPECT_EQ(consumer.commits, 0);
+    EXPECT_TRUE(consumer.reset().ok());
+}
+
+TEST(KafkaShareConsumerTest, ReuseKeepsCapacityAndResetsProcessedPrefix) {
+    RecordingShareConsumer consumer;
+    prepare_batch(consumer._batch, {{0, 101}, {0, 100}, {1, 50}}, 2);
+    auto capacity = consumer._batch.capacity();
+    ASSERT_TRUE(consumer.acknowledge_committed().ok());
+    EXPECT_EQ(consumer._batch.capacity(), capacity);
+    EXPECT_EQ(consumer._batch.processed(), 0);
+    ASSERT_TRUE(consumer.reset().ok());
+
+    prepare_batch(consumer._batch, {{2, 9}, {2, 4}}, 1);
+    ASSERT_TRUE(consumer.acknowledge_committed().ok());
+    EXPECT_EQ(
+            consumer.acknowledgements,
+            (std::vector<std::tuple<int32_t, int64_t, bool>> {
+                    {0, 101, true}, {0, 100, true}, {1, 50, false}, {2, 9, true}, {2, 4, false}}));
+    EXPECT_EQ(consumer._batch.capacity(), capacity);
+    EXPECT_EQ(consumer.commits, 2);
+    EXPECT_TRUE(consumer._batch.empty());
     EXPECT_TRUE(consumer.reset().ok());
 }
 
 TEST(KafkaShareConsumerTest, BufferMemoryFollowsConsumerAcrossThreads) {
     auto consumer = std::make_unique<RecordingShareConsumer>();
-    auto tracker = consumer->_mem_tracker;
+    auto tracker = consumer->_batch.mem_tracker();
     std::thread worker([&] {
-        consumer->reserve_records(1024);
+        consumer->_batch.reserve(1024);
         EXPECT_EQ(tracker->consumption(),
-                  consumer->_records.capacity() * sizeof(std::pair<int32_t, int64_t>));
-        consumer->_records.emplace_back(0, 100);
-        consumer->_processed = 1;
+                  consumer->_batch.capacity() * sizeof(KafkaShareBatch::Record));
+        consumer->_batch.add_record(0, 100);
+        consumer->_batch.mark_processed();
         EXPECT_TRUE(consumer->acknowledge_committed().ok());
         EXPECT_TRUE(consumer->reset().ok());
-        consumer->reserve_records(4096);
+        consumer->_batch.reserve(4096);
         EXPECT_EQ(tracker->consumption(),
-                  consumer->_records.capacity() * sizeof(std::pair<int32_t, int64_t>));
+                  consumer->_batch.capacity() * sizeof(KafkaShareBatch::Record));
     });
     worker.join();
     EXPECT_GT(tracker->consumption(), 0);
@@ -160,7 +182,7 @@ TEST(KafkaShareConsumerTest, BufferMemoryFollowsConsumerAcrossThreads) {
             MemTrackerLimiter::create_shared(MemTrackerLimiter::Type::OTHER, "ShareTestCaller");
     std::thread cleanup([&] {
         SCOPED_ATTACH_TASK(caller_tracker);
-        consumer->reserve_records(8192);
+        consumer->_batch.reserve(8192);
         EXPECT_EQ(thread_context()->thread_mem_tracker_mgr->limiter_mem_tracker(),
                   caller_tracker.get());
         consumer.reset();

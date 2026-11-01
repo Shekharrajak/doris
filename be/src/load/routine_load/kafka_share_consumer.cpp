@@ -49,16 +49,41 @@ Status share_status(rd_kafka_error_t* error) {
 }
 } // namespace
 
-KafkaShareConsumer::KafkaShareConsumer()
+KafkaShareBatch::KafkaShareBatch()
         : _mem_tracker(MemTrackerLimiter::create_shared(MemTrackerLimiter::Type::OTHER,
                                                         "KafkaShareConsumer")) {}
 
-KafkaShareConsumer::~KafkaShareConsumer() {
+KafkaShareBatch::~KafkaShareBatch() {
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
-    // Release pooled buffer capacity before detaching its tracker.
-    Defer release_records {[&] { decltype(_records)().swap(_records); }};
+    decltype(_records)().swap(_records);
+}
+
+void KafkaShareBatch::reserve(size_t count) {
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
+    _records.reserve(count);
+}
+
+void KafkaShareBatch::add_record(int32_t partition, int64_t offset) {
+    // reserve() binds capacity allocations to the batch tracker before appending.
+    DCHECK_LT(_records.size(), _records.capacity());
+    _records.emplace_back(partition, offset);
+}
+
+void KafkaShareBatch::mark_processed() {
+    DCHECK_LT(_processed, _records.size());
+    ++_processed;
+}
+
+void KafkaShareBatch::clear() {
+    _records.clear();
+    _processed = 0;
+}
+
+KafkaShareConsumer::KafkaShareConsumer() = default;
+
+KafkaShareConsumer::~KafkaShareConsumer() {
     if (_consumer != nullptr) {
-        if (!_records.empty()) {
+        if (!_batch.empty()) {
             auto status = acknowledge(false);
             if (!status.ok()) {
                 LOG(WARNING) << "Failed to release share batch: " << status;
@@ -118,7 +143,7 @@ Status KafkaShareConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
 }
 
 Status KafkaShareConsumer::consume(std::shared_ptr<StreamLoadContext> ctx) {
-    DCHECK(_records.empty());
+    DCHECK(_batch.empty());
     KafkaReaderTelemetry telemetry(ctx->job_id, _id, true);
     rd_kafka_messages_t* batch = nullptr;
     Defer destroy_batch {[&] { rd_kafka_messages_destroy(batch); }};
@@ -138,10 +163,10 @@ Status KafkaShareConsumer::consume(std::shared_ptr<StreamLoadContext> ctx) {
     int64_t bytes = 0;
     size_t count = batch == nullptr ? 0 : rd_kafka_messages_count(batch);
     share_received_records << count;
-    reserve_records(count);
+    _batch.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         auto* message = rd_kafka_messages_get(batch, i);
-        _records.emplace_back(message->partition, message->offset);
+        _batch.add_record(message->partition, message->offset);
         if (telemetry.enabled() && message->err == RD_KAFKA_RESP_ERR_NO_ERROR) {
             telemetry.received(message->partition, UnixMillis());
         }
@@ -149,7 +174,7 @@ Status KafkaShareConsumer::consume(std::shared_ptr<StreamLoadContext> ctx) {
     telemetry.flush();
     const int64_t append_start = MonotonicNanos();
     for (size_t i = 0; i < count; ++i) {
-        if (std::cmp_greater_equal(_processed, ctx->max_batch_rows) ||
+        if (std::cmp_greater_equal(_batch.processed(), ctx->max_batch_rows) ||
             bytes >= ctx->max_batch_size) {
             break;
         }
@@ -162,35 +187,28 @@ Status KafkaShareConsumer::consume(std::shared_ptr<StreamLoadContext> ctx) {
             RETURN_IF_ERROR((pipe.get()->*append)(static_cast<const char*>(message->payload),
                                                   message->len));
         }
-        ++_processed;
+        _batch.mark_processed();
         bytes += message->len;
     }
     telemetry.timing("append", MonotonicNanos() - append_start);
     ctx->receive_bytes = bytes;
-    DorisMetrics::instance()->routine_load_consume_rows->increment(_processed);
+    DorisMetrics::instance()->routine_load_consume_rows->increment(_batch.processed());
     DorisMetrics::instance()->routine_load_consume_bytes->increment(bytes);
     return pipe->finish();
 }
 
-void KafkaShareConsumer::reserve_records(size_t count) {
-    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
-    _records.reserve(count);
-}
-
 Status KafkaShareConsumer::acknowledge(bool committed) {
-    if (_records.empty()) {
+    if (_batch.empty()) {
         return Status::OK();
     }
     _reusable = false;
-    Defer clear_records {[&] {
-        _records.clear();
-        _processed = 0;
-    }};
+    Defer clear_batch {[&] { _batch.clear(); }};
     Status status;
     bool staged = false;
-    for (size_t i = 0; i < _records.size(); ++i) {
-        auto st = acknowledge_record(_records[i].first, _records[i].second,
-                                     committed && i < _processed);
+    for (size_t i = 0; i < _batch.size(); ++i) {
+        const auto& record = _batch.record(i);
+        auto st = acknowledge_record(record.first, record.second,
+                                     committed && i < _batch.processed());
         if (st.ok()) {
             staged = true;
         } else if (status.ok()) {
@@ -240,7 +258,7 @@ Status KafkaShareConsumer::commit_acknowledgements() {
 }
 
 Status KafkaShareConsumer::acknowledge_committed() {
-    share_committed_records << _processed;
+    share_committed_records << _batch.processed();
     auto status = acknowledge(true);
     if (!status.ok()) {
         share_ack_failures << 1;
@@ -253,7 +271,7 @@ Status KafkaShareConsumer::cancel(std::shared_ptr<StreamLoadContext> ctx) {
 }
 
 Status KafkaShareConsumer::reset() {
-    if (!_records.empty() || !_reusable) {
+    if (!_batch.empty() || !_reusable) {
         return Status::InternalError("Cannot reuse an unresolved Kafka share consumer");
     }
     _last_visit_time = time(nullptr);
@@ -262,7 +280,7 @@ Status KafkaShareConsumer::reset() {
 
 bool KafkaShareConsumer::match(std::shared_ptr<StreamLoadContext> ctx) {
     return ctx->load_src_type == TLoadSourceType::KAFKA && ctx->kafka_info->use_share_consumer &&
-           _reusable && _records.empty() && _brokers == ctx->kafka_info->brokers &&
+           _reusable && _batch.empty() && _brokers == ctx->kafka_info->brokers &&
            _topic == ctx->kafka_info->topic && _properties == ctx->kafka_info->properties;
 }
 
