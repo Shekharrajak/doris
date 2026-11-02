@@ -764,6 +764,21 @@ struct TCommitTxnResult {
     2: optional Types.TNetworkAddress master_address
 }
 
+struct TGetKafkaSourceCompletionsRequest {
+    1: optional i64 db_id
+    2: optional i64 txn_id
+    3: optional i64 job_id
+    4: optional Types.TUniqueId task_id
+    5: optional Types.TKafkaSourceDescriptor source
+    6: optional string token
+}
+
+struct TGetKafkaSourceCompletionsResult {
+    1: optional Status.TStatus status
+    // Absence means no known completion, not proof that records are new.
+    2: optional Types.TKafkaSourceDescriptor completed_source
+}
+
 struct TLoadTxn2PCRequest {
     1: optional string cluster
     2: required string user
@@ -2056,6 +2071,7 @@ service FrontendService {
     TBeginTxnResult beginTxn(1: TBeginTxnRequest request)
     TCommitTxnResult commitTxn(1: TCommitTxnRequest request)
     TRollbackTxnResult rollbackTxn(1: TRollbackTxnRequest request)
+    TGetKafkaSourceCompletionsResult getKafkaSourceCompletions(1: TGetKafkaSourceCompletionsRequest request)
 
     // Remote transaction RPCs for cross-cluster export.
     TBeginRemoteTxnResult beginRemoteTxn(1: TBeginRemoteTxnRequest request)

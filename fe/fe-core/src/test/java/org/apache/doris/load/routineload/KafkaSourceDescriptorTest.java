@@ -100,6 +100,22 @@ public class KafkaSourceDescriptorTest {
     }
 
     @Test
+    public void testThriftRoundTripReturnsIndependentCopies() {
+        KafkaSourceDescriptor descriptor = KafkaSourceDescriptor.fromThrift(thriftDescriptor());
+        TKafkaSourceDescriptor first = descriptor.toThrift();
+        TKafkaSourceDescriptor second = descriptor.toThrift();
+        Assertions.assertEquals(thriftDescriptor(), first);
+        Assertions.assertEquals(descriptor, KafkaSourceDescriptor.fromThrift(first));
+
+        first.getPartitions().get(0).getTopicId().setLo(100);
+        first.getPartitions().get(0).getRanges().get(0).setLast(2);
+        first.getPartitions().clear();
+        Assertions.assertEquals(thriftDescriptor(), second);
+        Assertions.assertEquals(descriptor, KafkaSourceDescriptor.fromThrift(second));
+        Assertions.assertEquals(thriftDescriptor(), descriptor.toThrift());
+    }
+
+    @Test
     public void testUnsignedTopicOrderingAndDistinctIncarnations() {
         List<Partition> partitions = Arrays.asList(partition(0, 1, 0, new OffsetRange(1, 1)),
                 partition(0, 1, 1, new OffsetRange(1, 1)), partition(0, -1, 0, new OffsetRange(1, 1)),

@@ -107,6 +107,8 @@ import org.apache.doris.load.routineload.ErrorReason;
 import org.apache.doris.load.routineload.RoutineLoadJob;
 import org.apache.doris.load.routineload.RoutineLoadJob.JobState;
 import org.apache.doris.load.routineload.RoutineLoadManager;
+import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionQuery;
+import org.apache.doris.load.routineload.kafka.KafkaSourceDescriptor;
 import org.apache.doris.master.MasterImpl;
 import org.apache.doris.meta.MetaContext;
 import org.apache.doris.mysql.privilege.AccessControllerManager;
@@ -215,6 +217,8 @@ import org.apache.doris.thrift.TGetDbsParams;
 import org.apache.doris.thrift.TGetDbsResult;
 import org.apache.doris.thrift.TGetEncryptionKeysRequest;
 import org.apache.doris.thrift.TGetEncryptionKeysResult;
+import org.apache.doris.thrift.TGetKafkaSourceCompletionsRequest;
+import org.apache.doris.thrift.TGetKafkaSourceCompletionsResult;
 import org.apache.doris.thrift.TGetMasterTokenRequest;
 import org.apache.doris.thrift.TGetMasterTokenResult;
 import org.apache.doris.thrift.TGetMetaDB;
@@ -369,6 +373,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -1934,6 +1939,47 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             status.setStatusCode(TStatusCode.INTERNAL_ERROR);
             status.addToErrorMsgs(Strings.nullToEmpty(e.getMessage()));
             return result;
+        }
+        return result;
+    }
+
+    @Override
+    public TGetKafkaSourceCompletionsResult getKafkaSourceCompletions(TGetKafkaSourceCompletionsRequest request) {
+        TGetKafkaSourceCompletionsResult result = new TGetKafkaSourceCompletionsResult();
+        TStatus status = checkMaster();
+        result.setStatus(status);
+        if (status.getStatusCode() != TStatusCode.OK) {
+            return result;
+        }
+        try {
+            if (request == null || !request.isSetToken() || Strings.isNullOrEmpty(request.getToken())) {
+                throw new AuthenticationException("Authentication token is required");
+            }
+            checkTokenOrThrow(request.getToken());
+            if (Config.isCloudMode()) {
+                throw new UserException("Kafka source completion queries are not supported in cloud mode");
+            }
+            if (!request.isSetDbId() || request.getDbId() <= 0
+                    || !request.isSetTxnId() || request.getTxnId() <= 0
+                    || !request.isSetJobId() || request.getJobId() <= 0
+                    || !request.isSetTaskId() || !request.getTaskId().isSetHi() || !request.getTaskId().isSetLo()
+                    || !request.isSetSource()) {
+                throw new UserException("Incomplete Kafka source completion query");
+            }
+            KafkaSourceDescriptor source = KafkaSourceDescriptor.fromThrift(request.getSource());
+            UUID taskId = new UUID(request.getTaskId().getHi(), request.getTaskId().getLo());
+            Optional<KafkaSourceDescriptor> completed = KafkaSourceCompletionQuery.getCompleted(Env.getCurrentEnv(),
+                    request.getDbId(), request.getTxnId(), request.getJobId(), taskId, source);
+            if (completed.isPresent()) {
+                result.setCompletedSource(completed.get().toThrift());
+            }
+        } catch (UserException | IllegalArgumentException e) {
+            status.setStatusCode(TStatusCode.ANALYSIS_ERROR);
+            status.addToErrorMsgs(Strings.nullToEmpty(e.getMessage()));
+        } catch (Throwable e) {
+            LOG.warn("Failed to query Kafka source completions", e);
+            status.setStatusCode(TStatusCode.INTERNAL_ERROR);
+            status.addToErrorMsgs(Strings.nullToEmpty(e.getMessage()));
         }
         return result;
     }
