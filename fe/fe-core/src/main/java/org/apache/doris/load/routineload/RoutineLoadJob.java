@@ -872,6 +872,16 @@ public abstract class RoutineLoadJob
         }
     }
 
+    public boolean containsRunningTask(UUID taskId, long transactionId) {
+        readLock();
+        try {
+            return state == JobState.RUNNING && routineLoadTaskInfoList.stream()
+                    .anyMatch(task -> task.getId().equals(taskId) && task.getTxnId() == transactionId);
+        } finally {
+            readUnlock();
+        }
+    }
+
     public boolean isAbnormalPause() {
         return this.state == JobState.PAUSED && this.pauseReason != null
                     && this.pauseReason.getCode() != InternalErrorCode.MANUAL_PAUSE_ERR;

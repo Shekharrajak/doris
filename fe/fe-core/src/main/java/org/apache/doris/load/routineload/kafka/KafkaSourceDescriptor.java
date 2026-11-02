@@ -25,6 +25,7 @@ import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.thrift.TKafkaSourceDescriptor;
 import org.apache.doris.thrift.TKafkaSourceOffsetRange;
 import org.apache.doris.thrift.TKafkaSourcePartition;
+import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -106,6 +107,22 @@ public final class KafkaSourceDescriptor implements GsonPostProcessable {
             descriptor.addPartitions(sourcePartition);
         }
         return descriptor.build();
+    }
+
+    public TKafkaSourceDescriptor toThrift() {
+        TKafkaSourceDescriptor descriptor = new TKafkaSourceDescriptor()
+                .setNamespaceId(namespaceId).setClusterId(clusterId);
+        for (Partition partition : partitions) {
+            TKafkaSourcePartition sourcePartition = new TKafkaSourcePartition()
+                    .setTopicId(new TUniqueId(partition.topicIdHi, partition.topicIdLo))
+                    .setPartition(partition.partition);
+            for (OffsetRange range : partition.ranges) {
+                sourcePartition.addToRanges(new TKafkaSourceOffsetRange()
+                        .setFirst(range.first).setLast(range.last));
+            }
+            descriptor.addToPartitions(sourcePartition);
+        }
+        return descriptor;
     }
 
     public long getNamespaceId() {
