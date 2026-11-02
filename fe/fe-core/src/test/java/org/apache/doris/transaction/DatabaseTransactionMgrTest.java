@@ -47,13 +47,23 @@ import org.apache.doris.job.extensions.insert.streaming.StreamingInsertJob;
 import org.apache.doris.job.extensions.insert.streaming.StreamingTaskTxnCommitAttachment;
 import org.apache.doris.job.offset.jdbc.JdbcOffset;
 import org.apache.doris.job.offset.jdbc.JdbcSourceOffsetProvider;
+import org.apache.doris.load.routineload.RLTaskTxnCommitAttachment;
 import org.apache.doris.meta.MetaContext;
 import org.apache.doris.mtmv.ivm.IvmInfo;
 import org.apache.doris.mysql.authenticate.TestLogAppender;
+import org.apache.doris.persist.EditLog;
+import org.apache.doris.persist.OperationType;
+import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.Backend;
 import org.apache.doris.task.PublishVersionTask;
+import org.apache.doris.thrift.TKafkaRLTaskProgress;
+import org.apache.doris.thrift.TKafkaSourceDescriptor;
+import org.apache.doris.thrift.TKafkaSourceOffsetRange;
+import org.apache.doris.thrift.TKafkaSourcePartition;
+import org.apache.doris.thrift.TLoadSourceType;
 import org.apache.doris.thrift.TPartitionVersionInfo;
+import org.apache.doris.thrift.TRLTaskTxnCommitAttachment;
 import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.GlobalTransactionMgrTest.SubTransactionInfo;
 import org.apache.doris.transaction.TransactionState.LoadJobSourceType;
@@ -86,8 +96,11 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class DatabaseTransactionMgrTest {
@@ -1024,6 +1037,256 @@ public class DatabaseTransactionMgrTest {
                 jobLock.writeLock().unlock();
             }
         }
+    }
+
+    private TransactionState sourceTransaction() throws AnalysisException {
+        FakeEnv.setEnv(masterEnv);
+        TransactionState state = masterTransMgr.getTransactionState(CatalogTestUtil.testDbId1,
+                LabelToTxnId.get(CatalogTestUtil.testTxnLabel2));
+        state.setCallbackId(state.getTransactionId());
+        TxnStateChangeCallback callback = Mockito.mock(TxnStateChangeCallback.class);
+        Mockito.when(callback.getId()).thenReturn(state.getCallbackId());
+        masterTransMgr.getCallbackFactory().addCallback(callback);
+        return state;
+    }
+
+    private RLTaskTxnCommitAttachment sourceAttachment(TransactionState state, long offset) {
+        TKafkaSourceDescriptor descriptor = new TKafkaSourceDescriptor().setNamespaceId(state.getCallbackId())
+                .setClusterId("source-cluster").setPartitions(Collections.singletonList(new TKafkaSourcePartition()
+                        .setTopicId(new TUniqueId(1, 2)).setPartition(0)
+                        .setRanges(Collections.singletonList(new TKafkaSourceOffsetRange()
+                                .setFirst(offset).setLast(offset)))));
+        return new RLTaskTxnCommitAttachment(new TRLTaskTxnCommitAttachment().setLoadSourceType(TLoadSourceType.KAFKA)
+                .setId(new TUniqueId(3, 4)).setJobId(state.getCallbackId())
+                .setKafkaRLTaskProgress(new TKafkaRLTaskProgress(Collections.emptyMap()))
+                .setKafkaSourceDescriptor(descriptor));
+    }
+
+    private List<Table> sourceTables() throws UserException {
+        return Collections.singletonList(masterEnv.getInternalCatalog().getDbOrMetaException(CatalogTestUtil.testDbId1)
+                .getTableOrMetaException(CatalogTestUtil.testTableId1));
+    }
+
+    private List<TabletCommitInfo> sourceCommitInfos() {
+        return GlobalTransactionMgrTest.generateTabletCommitInfos(CatalogTestUtil.testTabletId1, allBackends);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testKafkaSourceCommitRetryPreservesIdentity(boolean logOutsideLock) throws Exception {
+        boolean originalLogOutsideLock = Config.enable_txn_log_outside_lock;
+        try {
+            Config.enable_txn_log_outside_lock = logOutsideLock;
+            TransactionState state = sourceTransaction();
+            DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+            RLTaskTxnCommitAttachment attachment = sourceAttachment(state, 10);
+            List<Table> tables = sourceTables();
+            manager.commitTransaction(tables, state.getTransactionId(), sourceCommitInfos(), attachment, false);
+            Assertions.assertDoesNotThrow(state::awaitKafkaSourceCommitDurability);
+            Assertions.assertSame(attachment, state.getTxnCommitAttachment());
+
+            Mockito.clearInvocations(masterEnv.getEditLog());
+            manager.commitTransaction(tables, state.getTransactionId(), sourceCommitInfos(),
+                    sourceAttachment(state, 10), false);
+            Assertions.assertThrows(TransactionCommitFailedException.class,
+                    () -> manager.commitTransaction(tables, state.getTransactionId(), sourceCommitInfos(),
+                            sourceAttachment(state, 11), false));
+            Assertions.assertThrows(TransactionCommitFailedException.class,
+                    () -> manager.commitTransaction(tables, state.getTransactionId(), sourceCommitInfos(),
+                            null, false));
+            Assertions.assertSame(attachment, state.getTxnCommitAttachment());
+            Mockito.verifyNoInteractions(masterEnv.getEditLog());
+        } finally {
+            Config.enable_txn_log_outside_lock = originalLogOutsideLock;
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testKafkaSourceRetryWaitsForNativeJournal(boolean innerRetry) throws Exception {
+        boolean originalLogOutsideLock = Config.enable_txn_log_outside_lock;
+        CountDownLatch journalEntered = new CountDownLatch(1);
+        CountDownLatch releaseJournal = new CountDownLatch(1);
+        CountDownLatch firstBeforeCommit = new CountDownLatch(1);
+        CountDownLatch releaseFirstBeforeCommit = new CountDownLatch(1);
+        CountDownLatch innerRetryReleasedCallback = new CountDownLatch(1);
+        List<Thread> threads = new ArrayList<>();
+        try {
+            Config.enable_txn_log_outside_lock = true;
+            TransactionState state = sourceTransaction();
+            DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+            RLTaskTxnCommitAttachment attachment = sourceAttachment(state, 10);
+            List<Table> tables = sourceTables();
+            TxnStateChangeCallback callback = masterTransMgr.getCallbackFactory().getCallback(state.getCallbackId());
+            AtomicInteger beforeCalls = new AtomicInteger();
+            if (innerRetry) {
+                Mockito.doAnswer(invocation -> {
+                    if (beforeCalls.getAndIncrement() == 0) {
+                        firstBeforeCommit.countDown();
+                        Assertions.assertTrue(releaseFirstBeforeCommit.await(10, TimeUnit.SECONDS));
+                    }
+                    return null;
+                }).when(callback).beforeCommitted(state);
+                Mockito.doAnswer(invocation -> {
+                    innerRetryReleasedCallback.countDown();
+                    return null;
+                }).when(callback).afterCommitted(state, false);
+            }
+            EditLog.EditLogItem item = Mockito.mock(EditLog.EditLogItem.class);
+            Mockito.doAnswer(invocation -> {
+                Assertions.assertFalse(Thread.holdsLock(state));
+                Mockito.verify(callback).afterCommitted(state, true);
+                journalEntered.countDown();
+                Assertions.assertTrue(releaseJournal.await(10, TimeUnit.SECONDS));
+                return 1L;
+            }).when(item).await();
+            Mockito.when(masterEnv.getEditLog().submitEdit(Mockito.eq(OperationType.OP_UPSERT_TRANSACTION_STATE),
+                    Mockito.same(state))).thenReturn(item);
+
+            FutureTask<Void> owner = new FutureTask<>(() -> {
+                try (FakeEnv threadEnv = new FakeEnv()) {
+                    manager.commitTransaction(tables, state.getTransactionId(), sourceCommitInfos(), attachment, false);
+                }
+                return null;
+            });
+            FutureTask<Void> retry = new FutureTask<>(() -> {
+                try (FakeEnv threadEnv = new FakeEnv()) {
+                    manager.commitTransaction(tables, state.getTransactionId(), sourceCommitInfos(),
+                            sourceAttachment(state, 10), false);
+                }
+                return null;
+            });
+            if (innerRetry) {
+                Thread retryThread = new Thread(retry, "source-commit-inner-retry");
+                threads.add(retryThread);
+                retryThread.start();
+                Assertions.assertTrue(firstBeforeCommit.await(10, TimeUnit.SECONDS));
+            }
+            Thread ownerThread = new Thread(owner, "source-commit-owner");
+            threads.add(ownerThread);
+            ownerThread.start();
+            Assertions.assertTrue(journalEntered.await(10, TimeUnit.SECONDS));
+            TxnCommitAttachment boundAttachment = state.getTxnCommitAttachment();
+            if (innerRetry) {
+                releaseFirstBeforeCommit.countDown();
+                Assertions.assertTrue(innerRetryReleasedCallback.await(10, TimeUnit.SECONDS));
+            } else {
+                Thread retryThread = new Thread(retry, "source-commit-terminal-retry");
+                threads.add(retryThread);
+                retryThread.start();
+            }
+            Assertions.assertEquals(TransactionStatus.COMMITTED, state.getTransactionStatus());
+            Assertions.assertThrows(TimeoutException.class, () -> retry.get(100, TimeUnit.MILLISECONDS));
+            Mockito.doAnswer(invocation -> {
+                Assertions.assertFalse(Thread.holdsLock(state));
+                return null;
+            }).when(callback).afterAborted(state, false, "late abort");
+            Assertions.assertThrows(UserException.class,
+                    () -> manager.abortTransaction(state.getTransactionId(), "late abort",
+                            sourceAttachment(state, 11)));
+            Mockito.verify(callback).afterAborted(state, false, "late abort");
+            Assertions.assertSame(boundAttachment, state.getTxnCommitAttachment());
+            releaseJournal.countDown();
+            owner.get(10, TimeUnit.SECONDS);
+            retry.get(10, TimeUnit.SECONDS);
+            Mockito.verify(item).await();
+        } finally {
+            releaseFirstBeforeCommit.countDown();
+            releaseJournal.countDown();
+            for (Thread thread : threads) {
+                thread.join(10000);
+            }
+            Config.enable_txn_log_outside_lock = originalLogOutsideLock;
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testKafkaSourceJournalFailureCannotBecomeRetrySuccess(boolean enqueueFailure) throws Exception {
+        boolean originalLogOutsideLock = Config.enable_txn_log_outside_lock;
+        try {
+            Config.enable_txn_log_outside_lock = true;
+            TransactionState state = sourceTransaction();
+            DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+            RLTaskTxnCommitAttachment attachment = sourceAttachment(state, 10);
+            EditLog.EditLogItem item = Mockito.mock(EditLog.EditLogItem.class);
+            Mockito.when(item.await()).thenThrow(new IllegalStateException("journal outcome unknown"));
+            if (enqueueFailure) {
+                Mockito.when(masterEnv.getEditLog().submitEdit(Mockito.eq(OperationType.OP_UPSERT_TRANSACTION_STATE),
+                        Mockito.same(state))).thenThrow(new IllegalStateException("journal enqueue failed"));
+            } else {
+                Mockito.when(masterEnv.getEditLog().submitEdit(Mockito.eq(OperationType.OP_UPSERT_TRANSACTION_STATE),
+                        Mockito.same(state))).thenReturn(item);
+            }
+            Assertions.assertThrows(IllegalStateException.class,
+                    () -> manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                            attachment, false));
+            Assertions.assertEquals(TransactionStatus.COMMITTED, state.getTransactionStatus());
+            Assertions.assertThrows(TransactionCommitFailedException.class,
+                    () -> manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                            attachment, false));
+        } finally {
+            Config.enable_txn_log_outside_lock = originalLogOutsideLock;
+        }
+    }
+
+    @Test
+    public void testKafkaSourceBindingIsRecheckedAtCommitTransition() throws Exception {
+        TransactionState state = sourceTransaction();
+        DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+        TxnStateChangeCallback callback = masterTransMgr.getCallbackFactory().getCallback(state.getCallbackId());
+        Mockito.doAnswer(invocation -> {
+            state.bindKafkaSourceCommitAttachment(sourceAttachment(state, 10));
+            return null;
+        }).when(callback).beforeCommitted(state);
+        Mockito.clearInvocations(masterEnv.getEditLog());
+        Assertions.assertThrows(TransactionCommitFailedException.class,
+                () -> manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                        null, false));
+        Assertions.assertEquals(TransactionStatus.PREPARE, state.getTransactionStatus());
+        Assertions.assertTrue(state.getIdToTableCommitInfos().isEmpty());
+        Mockito.verify(callback).afterCommitted(state, false);
+        Mockito.verifyNoInteractions(masterEnv.getEditLog());
+    }
+
+    @Test
+    public void testKafkaSourceUnsupportedCommitRoutesFailBeforeMutation() throws Exception {
+        TransactionState state = sourceTransaction();
+        DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+        RLTaskTxnCommitAttachment attachment = sourceAttachment(state, 10);
+        Assertions.assertThrows(TransactionCommitFailedException.class,
+                () -> manager.preCommitTransaction2PC(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                        attachment));
+        Assertions.assertNull(state.getTxnCommitAttachment());
+        state.bindKafkaSourceCommitAttachment(attachment);
+        Assertions.assertThrows(TransactionCommitFailedException.class,
+                () -> manager.preCommitTransaction2PC(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                        null));
+        Assertions.assertThrows(TransactionCommitFailedException.class,
+                () -> manager.commitTransaction(sourceTables(), state.getTransactionId(), null, null, true));
+        Assertions.assertThrows(TransactionCommitFailedException.class,
+                () -> manager.commitTransaction(state.getTransactionId(), sourceTables(), Collections.emptyList()));
+        Assertions.assertEquals(TransactionStatus.PREPARE, state.getTransactionStatus());
+        Assertions.assertTrue(state.getIdToTableCommitInfos().isEmpty());
+    }
+
+    @Test
+    public void testKafkaSourceReplayAndImageRestoreDurableCommit() throws Exception {
+        TransactionState state = sourceTransaction();
+        DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+        manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                sourceAttachment(state, 10), false);
+        String snapshot = GsonUtils.GSON.toJson(state);
+        TransactionState image = GsonUtils.GSON.fromJson(snapshot, TransactionState.class);
+        Assertions.assertThrows(TransactionCommitFailedException.class, image::awaitKafkaSourceCommitDurability);
+        FakeEnv.setEnv(slaveEnv);
+        DatabaseTransactionMgr restored = slaveTransMgr.getDatabaseTransactionMgr(state.getDbId());
+        restored.unprotectUpsertTransactionState(image, true);
+        Assertions.assertDoesNotThrow(image::awaitKafkaSourceCommitDurability);
+
+        TransactionState replay = GsonUtils.GSON.fromJson(snapshot, TransactionState.class);
+        restored.replayUpsertTransactionState(replay);
+        Assertions.assertDoesNotThrow(replay::awaitKafkaSourceCommitDurability);
     }
 
     @ParameterizedTest

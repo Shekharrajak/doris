@@ -2108,7 +2108,16 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                         new SubTransactionState(subTxnInfo.getSubTxnId(), (Table) table,
                                 subTxnInfo.getTabletCommitInfos(), null));
             }
-            transactionState.setSubTxnIds(subTxnIds);
+            synchronized (transactionState) {
+                // Subtransactions do not carry the request's source descriptor to commit validation.
+                if (transactionState.hasKafkaSourceDescriptor() || (request.isSetTxnCommitAttachment()
+                        && request.getTxnCommitAttachment().isSetRlTaskTxnCommitAttachment()
+                        && request.getTxnCommitAttachment().getRlTaskTxnCommitAttachment()
+                                .isSetKafkaSourceDescriptor())) {
+                    throw new UserException("Kafka source commits do not support subtransactions");
+                }
+                transactionState.setSubTxnIds(subTxnIds);
+            }
             return Env.getCurrentGlobalTransactionMgr()
                     .commitAndPublishTransaction(db, request.getTxnId(),
                             subTransactionStates, timeoutMs);
