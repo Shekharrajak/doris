@@ -31,8 +31,8 @@ remainder. An expired acquisition does not prevent acknowledgements for other
 records; any acknowledgement failure discards that consumer instead of pooling it.
 If release fails or the BE dies, retry depends on broker-side acquisition expiry.
 A crash after commit but before acknowledgement, an expired acquisition, or an
-acknowledgement failure can duplicate rows. There is no destination replay
-suppression in this phase. Retention and delivery-attempt limits can prevent
+acknowledgement failure can duplicate rows. Replay suppression is disabled by
+default. Retention and delivery-attempt limits can prevent
 retry; load filtering retains the configured Routine Load behavior. Configure
 these policies explicitly for correctness experiments.
 
@@ -66,6 +66,23 @@ with `kafka_source_completion_max_partitions`, `kafka_source_completion_max_rang
 new tracked commits before COMMITTED. Quota changes require a restart. Existing
 facts survive lower limits, disabled tracking, and transaction/job cleanup; this
 phase has no automatic metadata retirement. Missing history remains unknown.
+
+## Experimental completion filtering
+
+With FE completion tracking enabled and all nodes upgraded, set
+`enable_kafka_share_completion_filtering=true` in `be.conf` and restart the BEs.
+This requires a librdkafka build exposing the delivered message topic UUID API.
+
+Before appending, each batch queries FE for exact completed source identities.
+Completed records are acknowledged even if loading new records fails. Unknown
+records are loaded once per batch and acknowledged after their transaction commits.
+An entirely completed batch aborts its unused transaction without committing rows;
+an unconfirmed abort is cleaned up by the FE transaction timeout.
+
+Lookup or identity errors stop the batch before appending. Unknown null payloads
+are released for retry; there is no automatic DLQ. Missing completion history stays
+unknown. Concurrent transactions can still write the same unknown records, so this
+option does not provide exactly-once ingestion.
 
 ## Kafka trunk regression
 

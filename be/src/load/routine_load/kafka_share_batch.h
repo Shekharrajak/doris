@@ -20,7 +20,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <utility>
 
 #include "core/custom_allocator.h"
 
@@ -30,7 +29,16 @@ class MemTrackerLimiter;
 
 class KafkaShareBatch {
 public:
-    using Record = std::pair<int32_t, int64_t>;
+    enum class Disposition { UNTOUCHED, DURABLE_DONE, APPENDED, DUPLICATE };
+
+    struct Record {
+        int32_t partition;
+        int64_t offset;
+        uint64_t topic_id_hi = 0;
+        uint64_t topic_id_lo = 0;
+        Disposition disposition = Disposition::UNTOUCHED;
+        size_t representative = 0;
+    };
 
     KafkaShareBatch();
     ~KafkaShareBatch();
@@ -42,7 +50,12 @@ public:
 
     void reserve(size_t count);
     void add_record(int32_t partition, int64_t offset);
-    void mark_processed();
+    void set_topic_id(size_t index, uint64_t hi, uint64_t lo);
+    void mark_done(size_t index);
+    void mark_appended(size_t index);
+    void mark_duplicate(size_t index, size_t representative);
+    bool should_accept(size_t index, bool committed) const;
+    bool all_records_completed() const;
     void clear();
 
     bool empty() const { return _records.empty(); }
