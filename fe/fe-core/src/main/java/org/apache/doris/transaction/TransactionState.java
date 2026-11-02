@@ -26,6 +26,8 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.load.routineload.RLTaskTxnCommitAttachment;
+import org.apache.doris.load.routineload.kafka.KafkaSourceDescriptor;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.task.PublishVersionTask;
@@ -55,7 +57,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 public class TransactionState implements Writable {
@@ -275,7 +279,8 @@ public class TransactionState implements Writable {
 
     // optional
     @SerializedName(value = "txnCommitAttachment")
-    private TxnCommitAttachment txnCommitAttachment;
+    private volatile TxnCommitAttachment txnCommitAttachment;
+    private transient volatile CompletableFuture<Void> kafkaSourceCommitDurability;
 
     // this map should be set when load execution begin, so that when the txn commit, it will know
     // which tables and rollups it loaded.
@@ -673,8 +678,116 @@ public class TransactionState implements Writable {
         return this.idToTableCommitInfos.get(tableId);
     }
 
-    public void setTxnCommitAttachment(TxnCommitAttachment txnCommitAttachment) {
-        this.txnCommitAttachment = txnCommitAttachment;
+    public synchronized void setTxnCommitAttachment(TxnCommitAttachment txnCommitAttachment) {
+        // A queued journal write may still reference this state's original source identity.
+        if (!hasKafkaSourceDescriptor()) {
+            this.txnCommitAttachment = txnCommitAttachment;
+        }
+    }
+
+    private static KafkaSourceDescriptor kafkaSourceDescriptor(TxnCommitAttachment attachment) {
+        return attachment instanceof RLTaskTxnCommitAttachment
+                ? ((RLTaskTxnCommitAttachment) attachment).getKafkaSourceDescriptor() : null;
+    }
+
+    public boolean hasKafkaSourceDescriptor() {
+        return kafkaSourceDescriptor(txnCommitAttachment) != null;
+    }
+
+    synchronized void bindKafkaSourceCommitAttachment(TxnCommitAttachment attachment)
+            throws TransactionCommitFailedException {
+        KafkaSourceDescriptor bound = kafkaSourceDescriptor(txnCommitAttachment);
+        KafkaSourceDescriptor incoming = kafkaSourceDescriptor(attachment);
+        if (bound == null && incoming == null) {
+            return;
+        }
+        if (subTxnIds != null) {
+            throw new TransactionCommitFailedException("Kafka source commits do not support subtransactions");
+        }
+        KafkaSourceDescriptor source = bound == null ? incoming : bound;
+        if (sourceType != LoadJobSourceType.ROUTINE_LOAD_TASK || callbackId != source.getNamespaceId()) {
+            throw new TransactionCommitFailedException("Kafka source namespace does not own transaction "
+                    + transactionId);
+        }
+        if (bound != null) {
+            if (!bound.equals(incoming)) {
+                throw new TransactionCommitFailedException("Kafka source identity changed for transaction "
+                        + transactionId);
+            }
+            return;
+        }
+        if (transactionStatus != TransactionStatus.PREPARE) {
+            throw new TransactionCommitFailedException("Cannot add Kafka source identity to transaction "
+                    + transactionId + " in state " + transactionStatus);
+        }
+        txnCommitAttachment = attachment;
+    }
+
+    synchronized void setTxnCommitAttachmentForAbort(TxnCommitAttachment attachment) {
+        if (hasKafkaSourceDescriptor() || (kafkaSourceDescriptor(attachment) != null
+                && (transactionStatus == TransactionStatus.COMMITTED || transactionStatus.isFinalStatus()))) {
+            return;
+        }
+        txnCommitAttachment = attachment;
+    }
+
+    synchronized void beginKafkaSourceCommitDurability() {
+        if (hasKafkaSourceDescriptor()) {
+            Preconditions.checkState(transactionStatus == TransactionStatus.PREPARE,
+                    "Kafka source commit must start from PREPARE");
+            Preconditions.checkState(kafkaSourceCommitDurability == null,
+                    "Kafka source commit durability already started");
+            kafkaSourceCommitDurability = new CompletableFuture<>();
+        }
+    }
+
+    void completeKafkaSourceCommitDurability() {
+        CompletableFuture<Void> durability = kafkaSourceCommitDurability;
+        if (durability != null) {
+            durability.complete(null);
+        }
+    }
+
+    void failKafkaSourceCommitDurability(Throwable failure) {
+        CompletableFuture<Void> durability = kafkaSourceCommitDurability;
+        if (durability != null) {
+            durability.completeExceptionally(failure);
+        }
+    }
+
+    void awaitKafkaSourceCommitDurability() throws TransactionCommitFailedException {
+        if (!hasKafkaSourceDescriptor()) {
+            return;
+        }
+        CompletableFuture<Void> durability = kafkaSourceCommitDurability;
+        if ((transactionStatus != TransactionStatus.COMMITTED && transactionStatus != TransactionStatus.VISIBLE)
+                || durability == null) {
+            throw new TransactionCommitFailedException("Kafka source commit durability is unknown for transaction "
+                    + transactionId);
+        }
+        try {
+            durability.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new TransactionCommitFailedException("Interrupted waiting for Kafka source commit "
+                    + transactionId, e);
+        } catch (ExecutionException e) {
+            throw new TransactionCommitFailedException("Kafka source commit durability failed for transaction "
+                    + transactionId, e.getCause());
+        }
+    }
+
+    synchronized void markReplayedKafkaSourceCommitDurable() {
+        if (hasKafkaSourceDescriptor() && (transactionStatus == TransactionStatus.COMMITTED
+                || transactionStatus == TransactionStatus.VISIBLE)) {
+            if (kafkaSourceCommitDurability == null) {
+                kafkaSourceCommitDurability = CompletableFuture.completedFuture(null);
+            } else {
+                Preconditions.checkState(kafkaSourceCommitDurability.isDone()
+                                && !kafkaSourceCommitDurability.isCompletedExceptionally(),
+                        "Cannot replace a live Kafka source commit outcome");
+            }
+        }
     }
 
     // return true if txn is in final status and label is expired

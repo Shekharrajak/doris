@@ -55,6 +55,7 @@ import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.InternalDatabaseUtil;
 import org.apache.doris.common.util.MetaLockUtils;
 import org.apache.doris.event.DataChangeEvent;
+import org.apache.doris.load.routineload.RLTaskTxnCommitAttachment;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.mtmv.MTMVUtil;
 import org.apache.doris.persist.BatchRemoveTransactionsOperationV2;
@@ -446,6 +447,7 @@ public class DatabaseTransactionMgr {
         } finally {
             readUnlock();
         }
+        rejectKafkaSourceCommitRoute(transactionState, txnCommitAttachment, "two-phase precommit");
         if (transactionState == null
                 || transactionState.getTransactionStatus() == TransactionStatus.ABORTED) {
             throw new TransactionCommitFailedException(
@@ -482,6 +484,7 @@ public class DatabaseTransactionMgr {
 
         EditLog.EditLogItem logItem = null;
         synchronized (transactionState) {
+            rejectKafkaSourceCommitRoute(transactionState, txnCommitAttachment, "two-phase precommit");
             unprotectedPreCommitTransaction2PC(transactionState, errorReplicaIds, tableToPartition,
                     totalInvolvedBackends, db);
             if (Config.enable_txn_log_outside_lock) {
@@ -885,6 +888,15 @@ public class DatabaseTransactionMgr {
         return true;
     }
 
+    private void rejectKafkaSourceCommitRoute(TransactionState transactionState, TxnCommitAttachment attachment,
+            String route) throws TransactionCommitFailedException {
+        if ((transactionState != null && transactionState.hasKafkaSourceDescriptor())
+                || (attachment instanceof RLTaskTxnCommitAttachment
+                        && ((RLTaskTxnCommitAttachment) attachment).getKafkaSourceDescriptor() != null)) {
+            throw new TransactionCommitFailedException("Kafka source-identified transactions do not support " + route);
+        }
+    }
+
     /**
      * commit transaction process as follows：
      * 1. validate whether `Load` is cancelled
@@ -909,12 +921,19 @@ public class DatabaseTransactionMgr {
             readUnlock();
         }
 
+        if (is2PC) {
+            rejectKafkaSourceCommitRoute(transactionState, txnCommitAttachment, "two-phase commit");
+        } else if (transactionState != null) {
+            transactionState.bindKafkaSourceCommitAttachment(txnCommitAttachment);
+        }
+
         if (DebugPointUtil.isEnable("DatabaseTransactionMgr.commitTransaction.failed")) {
             throw new TabletQuorumFailedException(transactionId,
                     "DebugPoint: DatabaseTransactionMgr.commitTransaction.failed");
         }
 
         if (!checkTransactionStateBeforeCommit(db, tableList, transactionId, is2PC, transactionState)) {
+            transactionState.awaitKafkaSourceCommitDurability();
             return;
         }
 
@@ -933,26 +952,41 @@ public class DatabaseTransactionMgr {
         transactionState.beforeStateTransform(TransactionStatus.COMMITTED);
         // transaction state transform
         boolean txnOperated = false;
+        boolean kafkaSourceCommitOwner = false;
+        boolean alreadyCommitted = false;
         EditLog.EditLogItem logItem = null;
         try {
             synchronized (transactionState) {
                 // Recheck under the same monitor as the transition: TSO allocation may race with abort.
-                if (!checkTransactionStatusBeforeCommit(transactionId, is2PC, transactionState)) {
-                    return;
-                }
                 if (is2PC) {
-                    unprotectedCommitTransaction2PC(transactionState, db, commitTSO);
+                    rejectKafkaSourceCommitRoute(transactionState, txnCommitAttachment, "two-phase commit");
                 } else {
-                    unprotectedCommitTransaction(transactionState, errorReplicaIds,
-                            tableToPartition, totalInvolvedBackends, db, commitTSO);
+                    transactionState.bindKafkaSourceCommitAttachment(txnCommitAttachment);
                 }
-                if (Config.enable_txn_log_outside_lock) {
-                    logItem = enqueueTransactionState(transactionState);
+                if (!checkTransactionStatusBeforeCommit(transactionId, is2PC, transactionState)) {
+                    alreadyCommitted = true;
                 } else {
-                    persistTransactionState(transactionState);
+                    transactionState.beginKafkaSourceCommitDurability();
+                    kafkaSourceCommitOwner = transactionState.hasKafkaSourceDescriptor();
+                    if (is2PC) {
+                        unprotectedCommitTransaction2PC(transactionState, db, commitTSO);
+                    } else {
+                        unprotectedCommitTransaction(transactionState, errorReplicaIds,
+                                tableToPartition, totalInvolvedBackends, db, commitTSO);
+                    }
+                    if (Config.enable_txn_log_outside_lock) {
+                        logItem = enqueueTransactionState(transactionState);
+                    } else {
+                        persistTransactionState(transactionState);
+                    }
+                    txnOperated = true;
                 }
-                txnOperated = true;
             }
+        } catch (UserException | RuntimeException | Error e) {
+            if (kafkaSourceCommitOwner) {
+                transactionState.failKafkaSourceCommitDurability(e);
+            }
+            throw e;
         } finally {
             // Always pair a successful before callback outside the transaction monitor.
             try {
@@ -961,8 +995,18 @@ public class DatabaseTransactionMgr {
                 LOG.warn("afterStateTransform txn {} failed. exception: ", transactionState, e);
             }
         }
+        if (alreadyCommitted) {
+            transactionState.awaitKafkaSourceCommitDurability();
+            return;
+        }
         if (txnOperated) {
-            awaitTransactionState(logItem, transactionState);
+            try {
+                awaitTransactionState(logItem, transactionState);
+                transactionState.completeKafkaSourceCommitDurability();
+            } catch (RuntimeException | Error e) {
+                transactionState.failKafkaSourceCommitDurability(e);
+                throw e;
+            }
         }
 
         // update nextVersion because of the failure of persistent transaction resulting in error version
@@ -982,6 +1026,8 @@ public class DatabaseTransactionMgr {
         } finally {
             readUnlock();
         }
+
+        rejectKafkaSourceCommitRoute(transactionState, null, "subtransactions");
 
         if (DebugPointUtil.isEnable("DatabaseTransactionMgr.commitTransaction.failed")) {
             throw new TabletQuorumFailedException(transactionId,
@@ -1020,6 +1066,7 @@ public class DatabaseTransactionMgr {
         EditLog.EditLogItem logItem = null;
         try {
             synchronized (transactionState) {
+                rejectKafkaSourceCommitRoute(transactionState, null, "subtransactions");
                 if (!checkTransactionStatusBeforeCommit(transactionId, false, transactionState)) {
                     return;
                 }
@@ -1917,6 +1964,10 @@ public class DatabaseTransactionMgr {
      * @param isReplay true if this is a replay operation (edit log already contains this state)
      */
     protected void unprotectUpdateInMemoryState(TransactionState transactionState, boolean isReplay) {
+        if (isReplay && (transactionState.getTransactionStatus() == TransactionStatus.COMMITTED
+                || transactionState.getTransactionStatus() == TransactionStatus.VISIBLE)) {
+            transactionState.markReplayedKafkaSourceCommitDurable();
+        }
         if (!transactionState.getTransactionStatus().isFinalStatus()) {
             if (idToRunningTransactionState.put(transactionState.getTransactionId(), transactionState) == null) {
                 runningTxnNums.incrementAndGet();
@@ -2043,24 +2094,27 @@ public class DatabaseTransactionMgr {
 
         // update transaction state extra if exists
         if (txnCommitAttachment != null) {
-            transactionState.setTxnCommitAttachment(txnCommitAttachment);
+            transactionState.setTxnCommitAttachmentForAbort(txnCommitAttachment);
         }
 
         // before state transform
         transactionState.beforeStateTransform(TransactionStatus.ABORTED);
         boolean txnOperated = false;
         EditLog.EditLogItem logItem = null;
-        synchronized (transactionState) {
-            txnOperated = unprotectAbortTransaction(transactionId, reason);
-            if (txnOperated) {
-                if (Config.enable_txn_log_outside_lock) {
-                    logItem = enqueueTransactionState(transactionState);
-                } else {
-                    persistTransactionState(transactionState);
+        try {
+            synchronized (transactionState) {
+                txnOperated = unprotectAbortTransaction(transactionId, reason);
+                if (txnOperated) {
+                    if (Config.enable_txn_log_outside_lock) {
+                        logItem = enqueueTransactionState(transactionState);
+                    } else {
+                        persistTransactionState(transactionState);
+                    }
                 }
             }
+        } finally {
+            transactionState.afterStateTransform(TransactionStatus.ABORTED, txnOperated, reason);
         }
-        transactionState.afterStateTransform(TransactionStatus.ABORTED, txnOperated, reason);
         if (txnOperated) {
             awaitTransactionState(logItem, transactionState);
         }
@@ -2100,17 +2154,20 @@ public class DatabaseTransactionMgr {
         transactionState.beforeStateTransform(TransactionStatus.ABORTED);
         boolean txnOperated = false;
         EditLog.EditLogItem logItem = null;
-        synchronized (transactionState) {
-            txnOperated = unprotectAbortTransaction(transactionId, "User Abort");
-            if (txnOperated) {
-                if (Config.enable_txn_log_outside_lock) {
-                    logItem = enqueueTransactionState(transactionState);
-                } else {
-                    persistTransactionState(transactionState);
+        try {
+            synchronized (transactionState) {
+                txnOperated = unprotectAbortTransaction(transactionId, "User Abort");
+                if (txnOperated) {
+                    if (Config.enable_txn_log_outside_lock) {
+                        logItem = enqueueTransactionState(transactionState);
+                    } else {
+                        persistTransactionState(transactionState);
+                    }
                 }
             }
+        } finally {
+            transactionState.afterStateTransform(TransactionStatus.ABORTED, txnOperated, "User Abort");
         }
-        transactionState.afterStateTransform(TransactionStatus.ABORTED, txnOperated, "User Abort");
         if (txnOperated) {
             awaitTransactionState(logItem, transactionState);
         }
@@ -2825,6 +2882,7 @@ public class DatabaseTransactionMgr {
         }
         writeLock();
         try {
+            transactionState.markReplayedKafkaSourceCommitDurable();
             // set transaction status will call txn state change listener
             transactionState.replaySetTransactionStatus();
             if (transactionState.getTransactionStatus() == TransactionStatus.COMMITTED) {
