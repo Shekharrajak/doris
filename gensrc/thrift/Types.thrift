@@ -307,6 +307,24 @@ struct TUniqueId {
   2: required i64 lo
 }
 
+// Inclusive offsets; gaps between ranges are not covered.
+struct TKafkaSourceOffsetRange {
+  1: optional i64 first
+  2: optional i64 last
+}
+
+struct TKafkaSourcePartition {
+  1: optional TUniqueId topicId
+  2: optional i32 partition
+  3: optional list<TKafkaSourceOffsetRange> ranges
+}
+
+struct TKafkaSourceDescriptor {
+  1: optional i64 namespaceId
+  2: optional string clusterId
+  3: optional list<TKafkaSourcePartition> partitions
+}
+
 enum QueryState {
   CREATED = 0,
   INITIALIZED = 1,

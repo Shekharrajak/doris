@@ -259,6 +259,9 @@ public class TxnUtil {
         if (rtTaskTxnCommitAttachment.getFirstErrorMsg() != null) {
             builder.setFirstErrorMsg(rtTaskTxnCommitAttachment.getFirstErrorMsg());
         }
+        if (rtTaskTxnCommitAttachment.getKafkaSourceDescriptor() != null) {
+            builder.setKafkaSourceDescriptor(rtTaskTxnCommitAttachment.getKafkaSourceDescriptor().toPb());
+        }
 
         attachementBuilder.setRlTaskTxnCommitAttachment(builder.build());
         return attachementBuilder.build();

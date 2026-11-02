@@ -20,10 +20,12 @@
 #include <gtest/gtest.h>
 
 #include <initializer_list>
+#include <limits>
 #include <thread>
 #include <tuple>
 #include <vector>
 
+#include "common/env_config.h"
 #include "load/routine_load/kafka_reader_telemetry.h"
 #include "runtime/thread_context.h"
 
@@ -193,6 +195,116 @@ TEST(KafkaShareConsumerTest, BufferMemoryFollowsConsumerAcrossThreads) {
     EXPECT_EQ(tracker->consumption(), 0);
     EXPECT_EQ(caller_tracker->consumption(), 0);
 }
+
+TEST(KafkaShareConsumerTest, SourceDescriptorKeepsProcessedPrefixAndSparseOffsets) {
+    RecordingShareConsumer consumer;
+    prepare_batch(consumer._batch, {{1, 9}, {0, 4}, {0, 2}, {0, 3}, {0, 6}, {0, 5}}, 5);
+    auto descriptor = consumer.build_source_descriptor(
+            42, "cluster-a", {{1, 2}, {1, 2}, {1, 2}, {1, 2}, {1, 2}, {0, 0}});
+    ASSERT_TRUE(descriptor.has_value());
+    EXPECT_EQ(descriptor->namespaceId, 42);
+    EXPECT_EQ(descriptor->clusterId, "cluster-a");
+    ASSERT_EQ(descriptor->partitions.size(), 2);
+    const auto& partition = descriptor->partitions[0];
+    EXPECT_EQ(partition.topicId.hi, 1);
+    EXPECT_EQ(partition.topicId.lo, 2);
+    EXPECT_EQ(partition.partition, 0);
+    ASSERT_EQ(partition.ranges.size(), 2);
+    EXPECT_EQ(partition.ranges[0].first, 2);
+    EXPECT_EQ(partition.ranges[0].last, 4);
+    EXPECT_EQ(partition.ranges[1].first, 6);
+    EXPECT_EQ(partition.ranges[1].last, 6);
+    EXPECT_EQ(descriptor->partitions[1].partition, 1);
+    ASSERT_EQ(descriptor->partitions[1].ranges.size(), 1);
+    EXPECT_EQ(descriptor->partitions[1].ranges[0].first, 9);
+    EXPECT_EQ(descriptor->partitions[1].ranges[0].last, 9);
+    ASSERT_TRUE(consumer.acknowledge_committed().ok());
+    EXPECT_EQ(consumer.acknowledgements,
+              (std::vector<std::tuple<int32_t, int64_t, bool>> {{1, 9, true},
+                                                                {0, 4, true},
+                                                                {0, 2, true},
+                                                                {0, 3, true},
+                                                                {0, 6, true},
+                                                                {0, 5, false}}));
+}
+
+TEST(KafkaShareConsumerTest, SourceDescriptorSeparatesTopicIdsAndHandlesMaximumOffset) {
+    RecordingShareConsumer consumer;
+    constexpr auto max_offset = std::numeric_limits<int64_t>::max();
+    constexpr uint64_t high_bit = uint64_t {1} << 63;
+    prepare_batch(consumer._batch,
+                  {{0, max_offset}, {0, max_offset - 1}, {0, max_offset}, {0, 7}, {0, 8}}, 5);
+    auto descriptor = consumer.build_source_descriptor(
+            42, "cluster-a", {{high_bit, 4}, {high_bit, 4}, {high_bit, 4}, {1, 4}, {1, 4}});
+    ASSERT_TRUE(descriptor.has_value());
+    ASSERT_EQ(descriptor->partitions.size(), 2);
+    EXPECT_EQ(descriptor->partitions[0].topicId.hi, 1);
+    ASSERT_EQ(descriptor->partitions[0].ranges.size(), 1);
+    EXPECT_EQ(descriptor->partitions[0].ranges[0].first, 7);
+    EXPECT_EQ(descriptor->partitions[0].ranges[0].last, 8);
+    EXPECT_EQ(descriptor->partitions[1].topicId.hi, std::numeric_limits<int64_t>::min());
+    EXPECT_EQ(descriptor->partitions[1].topicId.lo, 4);
+    ASSERT_EQ(descriptor->partitions[1].ranges.size(), 1);
+    EXPECT_EQ(descriptor->partitions[1].ranges[0].first, max_offset - 1);
+    EXPECT_EQ(descriptor->partitions[1].ranges[0].last, max_offset);
+}
+
+TEST(KafkaShareConsumerTest, MissingMetadataOmitsWholeSourceDescriptor) {
+    RecordingShareConsumer consumer;
+    EXPECT_FALSE(consumer.build_source_descriptor(42, "cluster-a", {}).has_value());
+    prepare_batch(consumer._batch, {{0, 2}, {0, 4}}, 2);
+    EXPECT_FALSE(consumer.build_source_descriptor(42, "", {{1, 2}, {1, 2}}).has_value());
+    EXPECT_FALSE(consumer.build_source_descriptor(42, "cluster-a", {{1, 2}, {0, 0}}).has_value());
+}
+
+TEST(KafkaShareConsumerTest, SourceDescriptorReachesNativeCommitAttachment) {
+    RecordingShareConsumer consumer;
+    prepare_batch(consumer._batch, {{0, 2}, {0, 4}}, 1);
+    StreamLoadContext ctx(nullptr);
+    ctx.job_id = 42;
+    ctx.load_type = TLoadType::ROUTINE_LOAD;
+    ctx.load_src_type = TLoadSourceType::KAFKA;
+    TKafkaLoadInfo info;
+    info.__set_use_share_consumer(true);
+    ctx.kafka_info = std::make_unique<KafkaLoadInfo>(info);
+    ctx.kafka_info->source_descriptor =
+            consumer.build_source_descriptor(ctx.job_id, "cluster-a", {{1, 2}, {1, 2}});
+    ASSERT_TRUE(ctx.kafka_info->source_descriptor.has_value());
+    StreamLoadExecutor executor(nullptr);
+    TLoadTxnCommitRequest request;
+    executor.get_commit_request(&ctx, request);
+    ASSERT_TRUE(request.__isset.txnCommitAttachment);
+    ASSERT_TRUE(request.txnCommitAttachment.__isset.rlTaskTxnCommitAttachment);
+    const auto& attachment = request.txnCommitAttachment.rlTaskTxnCommitAttachment;
+    ASSERT_TRUE(attachment.__isset.kafkaSourceDescriptor);
+    EXPECT_EQ(attachment.kafkaSourceDescriptor, *ctx.kafka_info->source_descriptor);
+
+    TTxnCommitAttachment rollback_attachment;
+    ASSERT_TRUE(executor.collect_load_stat(&ctx, &rollback_attachment));
+    EXPECT_EQ(rollback_attachment.rlTaskTxnCommitAttachment.kafkaSourceDescriptor,
+              attachment.kafkaSourceDescriptor);
+    ctx.kafka_info->source_descriptor.reset();
+    TTxnCommitAttachment legacy_attachment;
+    ASSERT_TRUE(executor.collect_load_stat(&ctx, &legacy_attachment));
+    EXPECT_FALSE(legacy_attachment.rlTaskTxnCommitAttachment.__isset.kafkaSourceDescriptor);
+}
+
+#ifndef HAVE_RDKAFKA_MESSAGE_TOPIC_ID
+TEST(KafkaShareConsumerTest, UnavailableIdentityApiPreservesAcknowledgements) {
+    RecordingShareConsumer consumer;
+    prepare_batch(consumer._batch, {{0, 2}, {0, 4}}, 1);
+    StreamLoadContext ctx(nullptr);
+    TKafkaLoadInfo info;
+    ctx.kafka_info = std::make_unique<KafkaLoadInfo>(info);
+    ctx.kafka_info->source_descriptor = TKafkaSourceDescriptor();
+    consumer.capture_source_descriptor(&ctx, nullptr);
+    EXPECT_FALSE(ctx.kafka_info->source_descriptor.has_value());
+    ASSERT_TRUE(consumer.acknowledge_committed().ok());
+    EXPECT_EQ(consumer.acknowledgements,
+              (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 2, true}, {0, 4, false}}));
+    EXPECT_TRUE(consumer.reset().ok());
+}
+#endif
 
 TEST(KafkaReaderTelemetryTest, DisabledDoesNotRetainRecords) {
     KafkaReaderTelemetry telemetry(42, UniqueId::gen_uid(), true);

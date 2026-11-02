@@ -28,6 +28,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -89,6 +90,7 @@ public:
     //custom kafka property key -> value
     std::map<std::string, std::string> properties;
     bool use_share_consumer = false;
+    std::optional<TKafkaSourceDescriptor> source_descriptor;
 };
 
 // AWS Kinesis related info
