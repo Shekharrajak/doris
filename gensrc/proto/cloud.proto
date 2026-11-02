@@ -428,6 +428,24 @@ message RoutineLoadProgressPB {
     // Error log URLs and first error messages are transient diagnostics and are not stored here.
 }
 
+// Inclusive offsets; gaps between ranges are not covered.
+message KafkaSourceOffsetRangePB {
+    optional int64 first = 1;
+    optional int64 last = 2;
+}
+
+message KafkaSourcePartitionPB {
+    optional UniqueIdPB topic_id = 1;
+    optional int32 partition = 2;
+    repeated KafkaSourceOffsetRangePB ranges = 3;
+}
+
+message KafkaSourceDescriptorPB {
+    optional int64 namespace_id = 1;
+    optional string cluster_id = 2;
+    repeated KafkaSourcePartitionPB partitions = 3;
+}
+
 message RLTaskTxnCommitAttachmentPB {
     optional int64 job_id = 1;
     optional UniqueIdPB task_id = 2;
@@ -439,6 +457,7 @@ message RLTaskTxnCommitAttachmentPB {
     optional RoutineLoadProgressPB progress = 8;
     optional string error_log_url = 9;
     optional string first_error_msg = 10;
+    optional KafkaSourceDescriptorPB kafka_source_descriptor = 11;
 }
 
 message RoutineLoadJobStatisticPB {

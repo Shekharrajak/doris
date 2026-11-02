@@ -19,6 +19,10 @@
 
 #include <librdkafka/rdkafka.h>
 
+#include <optional>
+#include <utility>
+#include <vector>
+
 #include "load/routine_load/data_consumer.h"
 #include "load/routine_load/kafka_share_batch.h"
 
@@ -41,9 +45,16 @@ protected:
     virtual Status commit_acknowledgements();
 
 private:
+    using TopicId = std::pair<uint64_t, uint64_t>;
+
+    std::optional<TKafkaSourceDescriptor> build_source_descriptor(
+            int64_t namespace_id, const std::string& cluster_id,
+            const std::vector<TopicId>& topic_ids) const;
+    void capture_source_descriptor(StreamLoadContext* ctx, rd_kafka_messages_t* messages);
     Status acknowledge(bool committed);
 
     rd_kafka_share_t* _consumer = nullptr;
+    rd_kafka_t* _client = nullptr;
     KafkaShareBatch _batch;
     bool _reusable = true;
     std::string _brokers;

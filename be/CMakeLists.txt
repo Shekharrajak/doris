@@ -369,6 +369,22 @@ endif()
 include(CheckFunctionExists)
 check_function_exists(sched_getcpu HAVE_SCHED_GETCPU)
 
+include(CheckCXXSourceCompiles)
+function(check_rdkafka_message_topic_id)
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+    set(CMAKE_REQUIRED_INCLUDES "${THIRDPARTY_DIR}/include")
+    unset(HAVE_RDKAFKA_MESSAGE_TOPIC_ID CACHE)
+    # The normal BE link verifies that the selected archive exports this API.
+    check_cxx_source_compiles("
+        #include \"${THIRDPARTY_DIR}/include/librdkafka/rdkafka.h\"
+        int main() {
+            const auto* id = rd_kafka_message_topic_id(nullptr);
+            return id ? static_cast<int>(rd_kafka_Uuid_most_significant_bits(id) ^
+                                         rd_kafka_Uuid_least_significant_bits(id)) : 0;
+        }" HAVE_RDKAFKA_MESSAGE_TOPIC_ID)
+endfunction()
+check_rdkafka_message_topic_id()
+
 function(TRY_TO_CHANGE_LINKER LINKER_COMMAND LINKER_NAME)
     if (CUSTUM_LINKER_COMMAND STREQUAL "ld")
         execute_process(COMMAND ${CMAKE_C_COMPILER} -fuse-ld=${LINKER_COMMAND} -Wl,--version ERROR_QUIET OUTPUT_VARIABLE LD_VERSION)

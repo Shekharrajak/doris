@@ -20,8 +20,12 @@
 #include <bvar/bvar.h>
 
 #include <algorithm>
+#include <bit>
+#include <limits>
+#include <tuple>
 #include <utility>
 
+#include "common/env_config.h"
 #include "common/metrics/doris_metrics.h"
 #include "io/fs/stream_load_pipe.h"
 #include "load/routine_load/consumer_group_helpers.h"
@@ -122,9 +126,23 @@ Status KafkaShareConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
     RETURN_IF_ERROR(set("bootstrap.servers", _brokers));
     RETURN_IF_ERROR(set("share.acknowledgement.mode", "explicit"));
     RETURN_IF_ERROR(set("socket.timeout.ms", "10000"));
+#ifdef HAVE_RDKAFKA_MESSAGE_TOPIC_ID
+    auto interceptor_error = rd_kafka_conf_interceptor_add_on_new(
+            conf, "doris-share-source-identity",
+            [](rd_kafka_t* client, const rd_kafka_conf_t*, void* opaque, char*, size_t) {
+                *static_cast<rd_kafka_t**>(opaque) = client;
+                return RD_KAFKA_RESP_ERR_NO_ERROR;
+            },
+            &_client);
+    if (interceptor_error != RD_KAFKA_RESP_ERR_NO_ERROR) {
+        return Status::InternalError("Kafka share source identity interceptor: {}",
+                                     rd_kafka_err2str(interceptor_error));
+    }
+#endif
     char error[512];
     _consumer = rd_kafka_share_consumer_new(conf, error, sizeof(error));
     if (_consumer == nullptr) {
+        _client = nullptr;
         return Status::InternalError("PAUSE: Failed to create Kafka share consumer: {}", error);
     }
     share_consumers << 1;
@@ -144,6 +162,7 @@ Status KafkaShareConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
 
 Status KafkaShareConsumer::consume(std::shared_ptr<StreamLoadContext> ctx) {
     DCHECK(_batch.empty());
+    ctx->kafka_info->source_descriptor.reset();
     KafkaReaderTelemetry telemetry(ctx->job_id, _id, true);
     rd_kafka_messages_t* batch = nullptr;
     Defer destroy_batch {[&] { rd_kafka_messages_destroy(batch); }};
@@ -194,7 +213,88 @@ Status KafkaShareConsumer::consume(std::shared_ptr<StreamLoadContext> ctx) {
     ctx->receive_bytes = bytes;
     DorisMetrics::instance()->routine_load_consume_rows->increment(_batch.processed());
     DorisMetrics::instance()->routine_load_consume_bytes->increment(bytes);
+    capture_source_descriptor(ctx.get(), batch);
     return pipe->finish();
+}
+
+void KafkaShareConsumer::capture_source_descriptor(StreamLoadContext* ctx,
+                                                   [[maybe_unused]] rd_kafka_messages_t* messages) {
+    ctx->kafka_info->source_descriptor.reset();
+#ifdef HAVE_RDKAFKA_MESSAGE_TOPIC_ID
+    if (_batch.processed() == 0) {
+        return;
+    }
+    char* cluster_id = rd_kafka_clusterid(_client, 0);
+    if (cluster_id == nullptr) {
+        return;
+    }
+    Defer free_cluster_id {[&] { rd_kafka_mem_free(_client, cluster_id); }};
+    std::vector<TopicId> topic_ids;
+    topic_ids.reserve(_batch.processed());
+    for (size_t i = 0; i < _batch.processed(); ++i) {
+        auto* message = rd_kafka_messages_get(messages, i);
+        const auto* topic_id = rd_kafka_message_topic_id(message);
+        if (topic_id == nullptr) {
+            topic_ids.emplace_back(0, 0);
+        } else {
+            topic_ids.emplace_back(
+                    static_cast<uint64_t>(rd_kafka_Uuid_most_significant_bits(topic_id)),
+                    static_cast<uint64_t>(rd_kafka_Uuid_least_significant_bits(topic_id)));
+        }
+    }
+    ctx->kafka_info->source_descriptor =
+            build_source_descriptor(ctx->job_id, cluster_id, topic_ids);
+#endif
+}
+
+std::optional<TKafkaSourceDescriptor> KafkaShareConsumer::build_source_descriptor(
+        int64_t namespace_id, const std::string& cluster_id,
+        const std::vector<TopicId>& topic_ids) const {
+    if (_batch.processed() == 0 || cluster_id.empty()) {
+        return std::nullopt;
+    }
+    DCHECK_GE(topic_ids.size(), _batch.processed());
+    std::vector<std::tuple<uint64_t, uint64_t, int32_t, int64_t>> records;
+    records.reserve(_batch.processed());
+    for (size_t i = 0; i < _batch.processed(); ++i) {
+        const auto& [hi, lo] = topic_ids[i];
+        if (hi == 0 && lo == 0) {
+            return std::nullopt;
+        }
+        const auto& [partition, offset] = _batch.record(i);
+        records.emplace_back(hi, lo, partition, offset);
+    }
+    std::sort(records.begin(), records.end());
+    std::vector<TKafkaSourcePartition> partitions;
+    for (const auto& [hi, lo, partition, offset] : records) {
+        TUniqueId topic_id;
+        topic_id.__set_hi(std::bit_cast<int64_t>(hi));
+        topic_id.__set_lo(std::bit_cast<int64_t>(lo));
+        if (partitions.empty() || partitions.back().topicId != topic_id ||
+            partitions.back().partition != partition) {
+            TKafkaSourcePartition source_partition;
+            source_partition.__set_topicId(topic_id);
+            source_partition.__set_partition(partition);
+            source_partition.__set_ranges({});
+            partitions.push_back(std::move(source_partition));
+        }
+        auto& ranges = partitions.back().ranges;
+        if (!ranges.empty() && (offset <= ranges.back().last ||
+                                (ranges.back().last != std::numeric_limits<int64_t>::max() &&
+                                 offset == ranges.back().last + 1))) {
+            ranges.back().__set_last(std::max(ranges.back().last, offset));
+        } else {
+            TKafkaSourceOffsetRange range;
+            range.__set_first(offset);
+            range.__set_last(offset);
+            ranges.push_back(std::move(range));
+        }
+    }
+    TKafkaSourceDescriptor descriptor;
+    descriptor.__set_namespaceId(namespace_id);
+    descriptor.__set_clusterId(cluster_id);
+    descriptor.__set_partitions(partitions);
+    return descriptor;
 }
 
 Status KafkaShareConsumer::acknowledge(bool committed) {

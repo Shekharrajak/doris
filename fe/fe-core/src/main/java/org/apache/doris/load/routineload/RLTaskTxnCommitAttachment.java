@@ -20,12 +20,15 @@ package org.apache.doris.load.routineload;
 import org.apache.doris.cloud.proto.Cloud.RLTaskTxnCommitAttachmentPB;
 import org.apache.doris.common.Config;
 import org.apache.doris.load.routineload.kafka.KafkaProgress;
+import org.apache.doris.load.routineload.kafka.KafkaSourceDescriptor;
 import org.apache.doris.load.routineload.kinesis.KinesisProgress;
+import org.apache.doris.thrift.TLoadSourceType;
 import org.apache.doris.thrift.TRLTaskTxnCommitAttachment;
 import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.TransactionState;
 import org.apache.doris.transaction.TxnCommitAttachment;
 
+import com.google.common.base.Preconditions;
 import com.google.gson.annotations.SerializedName;
 import org.apache.commons.lang3.StringUtils;
 
@@ -33,6 +36,7 @@ import org.apache.commons.lang3.StringUtils;
 // "numOfTotalData": "", "taskId": "", "jobId": ""}
 public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
 
+    @SerializedName(value = "jobId")
     private long jobId;
     private TUniqueId taskId;
     @SerializedName(value = "fr")
@@ -47,6 +51,8 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
     private long taskExecutionTimeMs;
     @SerializedName(value = "pro")
     private RoutineLoadProgress progress;
+    @SerializedName(value = "kafkaSourceDescriptor")
+    private KafkaSourceDescriptor kafkaSourceDescriptor;
     private String errorLogUrl;
     private String firstErrorMsg;
 
@@ -63,6 +69,13 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
         this.unselectedRows = rlTaskTxnCommitAttachment.getUnselectedRows();
         this.receivedBytes = rlTaskTxnCommitAttachment.getReceivedBytes();
         this.taskExecutionTimeMs = rlTaskTxnCommitAttachment.getLoadCostMs();
+        if (rlTaskTxnCommitAttachment.isSetKafkaSourceDescriptor()) {
+            Preconditions.checkArgument(rlTaskTxnCommitAttachment.getLoadSourceType() == TLoadSourceType.KAFKA,
+                    "Kafka source descriptor requires a Kafka routine load task");
+            this.kafkaSourceDescriptor = KafkaSourceDescriptor.fromThrift(
+                    rlTaskTxnCommitAttachment.getKafkaSourceDescriptor());
+            this.kafkaSourceDescriptor.validateForJob(jobId);
+        }
 
         switch (rlTaskTxnCommitAttachment.getLoadSourceType()) {
             case KAFKA:
@@ -93,6 +106,11 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
         this.unselectedRows = rlTaskTxnCommitAttachment.getUnselectedRows();
         this.receivedBytes = rlTaskTxnCommitAttachment.getReceivedBytes();
         this.taskExecutionTimeMs = rlTaskTxnCommitAttachment.getTaskExecutionTimeMs();
+        if (rlTaskTxnCommitAttachment.hasKafkaSourceDescriptor()) {
+            this.kafkaSourceDescriptor = KafkaSourceDescriptor.fromPb(
+                    rlTaskTxnCommitAttachment.getKafkaSourceDescriptor());
+            this.kafkaSourceDescriptor.validateForJob(jobId);
+        }
 
         KafkaProgress progress = new KafkaProgress(rlTaskTxnCommitAttachment.getProgress().getPartitionToOffset());
 
@@ -139,6 +157,20 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
 
     public RoutineLoadProgress getProgress() {
         return progress;
+    }
+
+    public KafkaSourceDescriptor getKafkaSourceDescriptor() {
+        return kafkaSourceDescriptor;
+    }
+
+    @Override
+    public void gsonPostProcess() {
+        super.gsonPostProcess();
+        if (kafkaSourceDescriptor != null) {
+            Preconditions.checkArgument(progress instanceof KafkaProgress,
+                    "Kafka source descriptor requires Kafka routine load progress");
+            kafkaSourceDescriptor.validateForJob(jobId);
+        }
     }
 
     public String getErrorLogUrl() {

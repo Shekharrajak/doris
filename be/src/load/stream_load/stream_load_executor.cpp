@@ -474,6 +474,9 @@ bool StreamLoadExecutor::collect_load_stat(StreamLoadContext* ctx, TTxnCommitAtt
 
         rl_attach.kafkaRLTaskProgress = kafka_progress;
         rl_attach.__isset.kafkaRLTaskProgress = true;
+        if (ctx->kafka_info->source_descriptor) {
+            rl_attach.__set_kafkaSourceDescriptor(*ctx->kafka_info->source_descriptor);
+        }
         if (!ctx->error_url.empty()) {
             rl_attach.__set_errorLogUrl(ctx->error_url);
         }
