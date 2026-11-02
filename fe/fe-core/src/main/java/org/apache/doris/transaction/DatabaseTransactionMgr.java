@@ -2154,17 +2154,20 @@ public class DatabaseTransactionMgr {
         transactionState.beforeStateTransform(TransactionStatus.ABORTED);
         boolean txnOperated = false;
         EditLog.EditLogItem logItem = null;
-        synchronized (transactionState) {
-            txnOperated = unprotectAbortTransaction(transactionId, "User Abort");
-            if (txnOperated) {
-                if (Config.enable_txn_log_outside_lock) {
-                    logItem = enqueueTransactionState(transactionState);
-                } else {
-                    persistTransactionState(transactionState);
+        try {
+            synchronized (transactionState) {
+                txnOperated = unprotectAbortTransaction(transactionId, "User Abort");
+                if (txnOperated) {
+                    if (Config.enable_txn_log_outside_lock) {
+                        logItem = enqueueTransactionState(transactionState);
+                    } else {
+                        persistTransactionState(transactionState);
+                    }
                 }
             }
+        } finally {
+            transactionState.afterStateTransform(TransactionStatus.ABORTED, txnOperated, "User Abort");
         }
-        transactionState.afterStateTransform(TransactionStatus.ABORTED, txnOperated, "User Abort");
         if (txnOperated) {
             awaitTransactionState(logItem, transactionState);
         }
