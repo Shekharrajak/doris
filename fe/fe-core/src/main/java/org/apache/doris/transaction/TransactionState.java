@@ -280,6 +280,8 @@ public class TransactionState implements Writable {
     // optional
     @SerializedName(value = "txnCommitAttachment")
     private volatile TxnCommitAttachment txnCommitAttachment;
+    @SerializedName(value = "kafkaSourceCompletionTracked")
+    private volatile boolean kafkaSourceCompletionTracked;
     private transient volatile CompletableFuture<Void> kafkaSourceCommitDurability;
 
     // this map should be set when load execution begin, so that when the txn commit, it will know
@@ -694,6 +696,22 @@ public class TransactionState implements Writable {
         return kafkaSourceDescriptor(txnCommitAttachment) != null;
     }
 
+    KafkaSourceDescriptor getKafkaSourceDescriptor() {
+        return kafkaSourceDescriptor(txnCommitAttachment);
+    }
+
+    boolean isKafkaSourceCompletionTracked() {
+        return kafkaSourceCompletionTracked;
+    }
+
+    synchronized void setKafkaSourceCompletionTracked(boolean tracked) {
+        Preconditions.checkState(transactionStatus == TransactionStatus.PREPARE,
+                "Kafka source completion tracking must be bound before commit");
+        Preconditions.checkState(!tracked || hasKafkaSourceDescriptor(),
+                "Kafka source completion tracking requires a source descriptor");
+        kafkaSourceCompletionTracked = tracked;
+    }
+
     synchronized void bindKafkaSourceCommitAttachment(TxnCommitAttachment attachment)
             throws TransactionCommitFailedException {
         KafkaSourceDescriptor bound = kafkaSourceDescriptor(txnCommitAttachment);
@@ -777,16 +795,21 @@ public class TransactionState implements Writable {
         }
     }
 
-    synchronized void markReplayedKafkaSourceCommitDurable() {
+    synchronized void validateReplayedKafkaSourceCommitDurability() {
         if (hasKafkaSourceDescriptor() && (transactionStatus == TransactionStatus.COMMITTED
                 || transactionStatus == TransactionStatus.VISIBLE)) {
-            if (kafkaSourceCommitDurability == null) {
-                kafkaSourceCommitDurability = CompletableFuture.completedFuture(null);
-            } else {
-                Preconditions.checkState(kafkaSourceCommitDurability.isDone()
-                                && !kafkaSourceCommitDurability.isCompletedExceptionally(),
-                        "Cannot replace a live Kafka source commit outcome");
-            }
+            Preconditions.checkState(kafkaSourceCommitDurability == null
+                            || (kafkaSourceCommitDurability.isDone()
+                                    && !kafkaSourceCommitDurability.isCompletedExceptionally()),
+                    "Cannot replace a live Kafka source commit outcome");
+        }
+    }
+
+    synchronized void markReplayedKafkaSourceCommitDurable() {
+        validateReplayedKafkaSourceCommitDurability();
+        if (hasKafkaSourceDescriptor() && (transactionStatus == TransactionStatus.COMMITTED
+                || transactionStatus == TransactionStatus.VISIBLE) && kafkaSourceCommitDurability == null) {
+            kafkaSourceCommitDurability = CompletableFuture.completedFuture(null);
         }
     }
 

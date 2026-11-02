@@ -56,6 +56,10 @@ import org.apache.doris.common.util.InternalDatabaseUtil;
 import org.apache.doris.common.util.MetaLockUtils;
 import org.apache.doris.event.DataChangeEvent;
 import org.apache.doris.load.routineload.RLTaskTxnCommitAttachment;
+import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionIndex.CapacityExceededException;
+import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionLedger;
+import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionLedger.Reservation;
+import org.apache.doris.load.routineload.kafka.KafkaSourceDescriptor;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.mtmv.MTMVUtil;
 import org.apache.doris.persist.BatchRemoveTransactionsOperationV2;
@@ -954,6 +958,8 @@ public class DatabaseTransactionMgr {
         boolean txnOperated = false;
         boolean kafkaSourceCommitOwner = false;
         boolean alreadyCommitted = false;
+        KafkaSourceCompletionLedger completionLedger = null;
+        Reservation completionReservation = null;
         EditLog.EditLogItem logItem = null;
         try {
             synchronized (transactionState) {
@@ -966,6 +972,18 @@ public class DatabaseTransactionMgr {
                 if (!checkTransactionStatusBeforeCommit(transactionId, is2PC, transactionState)) {
                     alreadyCommitted = true;
                 } else {
+                    if (Config.enable_kafka_source_completion_tracking && transactionState.hasKafkaSourceDescriptor()) {
+                        completionLedger = env.getKafkaSourceCompletionLedger();
+                        try {
+                            completionReservation = completionLedger.reserve(transactionId,
+                                    transactionState.getKafkaSourceDescriptor());
+                        } catch (CapacityExceededException e) {
+                            throw new TransactionCommitFailedException(e.getMessage(), e);
+                        }
+                    }
+                    if (!is2PC) {
+                        transactionState.setKafkaSourceCompletionTracked(completionReservation != null);
+                    }
                     transactionState.beginKafkaSourceCommitDurability();
                     kafkaSourceCommitOwner = transactionState.hasKafkaSourceDescriptor();
                     if (is2PC) {
@@ -983,6 +1001,14 @@ public class DatabaseTransactionMgr {
                 }
             }
         } catch (UserException | RuntimeException | Error e) {
+            if (completionReservation != null) {
+                synchronized (transactionState) {
+                    if (transactionState.getTransactionStatus() == TransactionStatus.PREPARE) {
+                        completionLedger.releaseUncommitted(completionReservation);
+                        transactionState.setKafkaSourceCompletionTracked(false);
+                    }
+                }
+            }
             if (kafkaSourceCommitOwner) {
                 transactionState.failKafkaSourceCommitDurability(e);
             }
@@ -1002,6 +1028,9 @@ public class DatabaseTransactionMgr {
         if (txnOperated) {
             try {
                 awaitTransactionState(logItem, transactionState);
+                if (completionReservation != null) {
+                    completionLedger.publishCommitted(completionReservation);
+                }
                 transactionState.completeKafkaSourceCommitDurability();
             } catch (RuntimeException | Error e) {
                 transactionState.failKafkaSourceCommitDurability(e);
@@ -1966,7 +1995,7 @@ public class DatabaseTransactionMgr {
     protected void unprotectUpdateInMemoryState(TransactionState transactionState, boolean isReplay) {
         if (isReplay && (transactionState.getTransactionStatus() == TransactionStatus.COMMITTED
                 || transactionState.getTransactionStatus() == TransactionStatus.VISIBLE)) {
-            transactionState.markReplayedKafkaSourceCommitDurable();
+            replayKafkaSourceCommitState(transactionState);
         }
         if (!transactionState.getTransactionStatus().isFinalStatus()) {
             if (idToRunningTransactionState.put(transactionState.getTransactionId(), transactionState) == null) {
@@ -1999,6 +2028,27 @@ public class DatabaseTransactionMgr {
         if (isReplay) {
             updateTxnLabels(transactionState);
         }
+    }
+
+    private void replayKafkaSourceCommitState(TransactionState transactionState) {
+        KafkaSourceDescriptor descriptor = null;
+        if (transactionState.isKafkaSourceCompletionTracked()
+                && (transactionState.getTransactionStatus() == TransactionStatus.COMMITTED
+                        || transactionState.getTransactionStatus() == TransactionStatus.VISIBLE)) {
+            Preconditions.checkState(transactionState.hasKafkaSourceDescriptor(),
+                    "Tracked Kafka source completion is missing its source descriptor");
+            descriptor = transactionState.getKafkaSourceDescriptor();
+            Preconditions.checkState(transactionState.getSourceType()
+                    == TransactionState.LoadJobSourceType.ROUTINE_LOAD_TASK
+                    && transactionState.getCallbackId() == descriptor.getNamespaceId()
+                    && transactionState.getSubTxnIds() == null,
+                    "Tracked Kafka source completion does not own its transaction");
+        }
+        transactionState.validateReplayedKafkaSourceCommitDurability();
+        if (descriptor != null) {
+            env.getKafkaSourceCompletionLedger().replayCommitted(transactionState.getTransactionId(), descriptor);
+        }
+        transactionState.markReplayedKafkaSourceCommitDurable();
     }
 
     /**
@@ -2882,7 +2932,7 @@ public class DatabaseTransactionMgr {
         }
         writeLock();
         try {
-            transactionState.markReplayedKafkaSourceCommitDurable();
+            replayKafkaSourceCommitState(transactionState);
             // set transaction status will call txn state change listener
             transactionState.replaySetTransactionStatus();
             if (transactionState.getTransactionStatus() == TransactionStatus.COMMITTED) {

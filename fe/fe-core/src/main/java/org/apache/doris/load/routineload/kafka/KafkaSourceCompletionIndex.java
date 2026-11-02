@@ -64,10 +64,45 @@ public final class KafkaSourceCompletionIndex {
     }
 
     private void add(KafkaSourceDescriptor descriptor, boolean enforceLimits) throws CapacityExceededException {
+        AdditionPlan plan = plan(descriptor);
+        if (enforceLimits && ((plan.partitionCount > maxSourcePartitions && plan.partitionCount > completed.size())
+                || (plan.rangeCount > maxOffsetRanges && plan.rangeCount > offsetRangeCount)
+                || (plan.identityBytes > maxIdentityBytes && plan.identityBytes > identityBytes))) {
+            throw new CapacityExceededException("Kafka source completion capacity exceeded: partitions="
+                    + plan.partitionCount + ", ranges=" + plan.rangeCount + ", identityBytes=" + plan.identityBytes);
+        }
+        for (Map.Entry<SourceKey, RangeSet<Long>> addition : plan.additions.entrySet()) {
+            RangeSet<Long> existing = completed.get(addition.getKey());
+            if (existing == null) {
+                completed.put(addition.getKey(), addition.getValue());
+            } else {
+                existing.addAll(addition.getValue());
+            }
+        }
+        offsetRangeCount = plan.rangeCount;
+        identityBytes = plan.identityBytes;
+    }
+
+    synchronized ReservationCapacity reservationCapacity(KafkaSourceDescriptor descriptor) {
+        return plan(descriptor).reservationCapacity;
+    }
+
+    synchronized void restore(KafkaSourceDescriptor descriptor) {
+        try {
+            add(descriptor, false);
+        } catch (CapacityExceededException e) {
+            throw new IllegalStateException("Recovery cannot reject durable Kafka source completion", e);
+        }
+    }
+
+    private AdditionPlan plan(KafkaSourceDescriptor descriptor) {
         Map<SourceKey, RangeSet<Long>> additions = new LinkedHashMap<>();
         long nextPartitionCount = completed.size();
         long nextRangeCount = offsetRangeCount;
         long nextIdentityBytes = identityBytes;
+        long reservedPartitions = 0;
+        long reservedRanges = 0;
+        long reservedIdentityBytes = 0;
         long sourceIdentityBytes = FIXED_IDENTITY_BYTES
                 + descriptor.getClusterId().getBytes(StandardCharsets.UTF_8).length;
         for (Partition partition : descriptor.getPartitions()) {
@@ -89,36 +124,27 @@ public final class KafkaSourceCompletionIndex {
             if (existing == null) {
                 nextPartitionCount++;
                 nextIdentityBytes = Math.addExact(nextIdentityBytes, sourceIdentityBytes);
+                reservedPartitions++;
+                reservedIdentityBytes = Math.addExact(reservedIdentityBytes, sourceIdentityBytes);
             }
             for (Range<Long> range : uncovered.asRanges()) {
-                nextRangeCount++;
+                long rangeGrowth = 1;
                 long first = range.lowerEndpoint();
                 long last = lastOffset(range);
                 if (existing != null && first > 0 && existing.contains(first - 1)) {
-                    nextRangeCount--;
+                    rangeGrowth--;
                 }
                 if (existing != null && last < Long.MAX_VALUE && existing.contains(last + 1)) {
-                    nextRangeCount--;
+                    rangeGrowth--;
                 }
+                nextRangeCount += rangeGrowth;
+                // Coalescing savings become available only after the owning commit is durable.
+                reservedRanges += Math.max(0, rangeGrowth);
             }
             additions.put(key, uncovered);
         }
-        if (enforceLimits && ((nextPartitionCount > maxSourcePartitions && nextPartitionCount > completed.size())
-                || (nextRangeCount > maxOffsetRanges && nextRangeCount > offsetRangeCount)
-                || (nextIdentityBytes > maxIdentityBytes && nextIdentityBytes > identityBytes))) {
-            throw new CapacityExceededException("Kafka source completion capacity exceeded: partitions="
-                    + nextPartitionCount + ", ranges=" + nextRangeCount + ", identityBytes=" + nextIdentityBytes);
-        }
-        for (Map.Entry<SourceKey, RangeSet<Long>> addition : additions.entrySet()) {
-            RangeSet<Long> existing = completed.get(addition.getKey());
-            if (existing == null) {
-                completed.put(addition.getKey(), addition.getValue());
-            } else {
-                existing.addAll(addition.getValue());
-            }
-        }
-        offsetRangeCount = nextRangeCount;
-        identityBytes = nextIdentityBytes;
+        return new AdditionPlan(additions, nextPartitionCount, nextRangeCount, nextIdentityBytes,
+                new ReservationCapacity(reservedPartitions, reservedRanges, reservedIdentityBytes));
     }
 
     // Missing completion evidence does not establish that an offset is new.
@@ -247,6 +273,13 @@ public final class KafkaSourceCompletionIndex {
             this.version = SNAPSHOT_VERSION;
             this.sources = sources;
         }
+    }
+
+    record ReservationCapacity(long sourcePartitions, long offsetRanges, long identityBytes) {
+    }
+
+    private record AdditionPlan(Map<SourceKey, RangeSet<Long>> additions, long partitionCount, long rangeCount,
+            long identityBytes, ReservationCapacity reservationCapacity) {
     }
 
     public static final class CapacityExceededException extends Exception {

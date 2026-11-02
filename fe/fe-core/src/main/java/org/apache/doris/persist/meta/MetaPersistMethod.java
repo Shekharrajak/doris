@@ -134,6 +134,13 @@ public class MetaPersistMethod {
                 metaPersistMethod.writeMethod =
                         Env.class.getDeclaredMethod("saveAuth", CountingDataOutputStream.class, long.class);
                 break;
+            case "kafkaSourceCompletions":
+                metaPersistMethod.readMethod =
+                        Env.class.getDeclaredMethod("loadKafkaSourceCompletions", DataInputStream.class, long.class);
+                metaPersistMethod.writeMethod =
+                        Env.class.getDeclaredMethod("saveKafkaSourceCompletions", CountingDataOutputStream.class,
+                                long.class);
+                break;
             case "transactionState":
                 metaPersistMethod.readMethod =
                         Env.class.getDeclaredMethod("loadTransactionState", DataInputStream.class, long.class);

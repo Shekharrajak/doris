@@ -39,7 +39,8 @@ public class PersistMetaModules {
     public static final ImmutableList<String> MODULE_NAMES = ImmutableList.of(
             "masterInfo", "frontends", "backends", "datasource", "db", "alterJob", "recycleBin",
             "globalVariable", "cluster", "broker", "resources", "exportJob", "backupHandler",
-            "paloAuth", "transactionState", "colocateTableIndex", "routineLoadJobs", "loadJobV2", "smallFiles",
+            "paloAuth", "kafkaSourceCompletions", "transactionState", "colocateTableIndex", "routineLoadJobs",
+            "loadJobV2", "smallFiles",
             "plugins", "deleteHandler", "sqlBlockRule", "policy",
             "globalFunction", "workloadGroups",
             "binlogs", "resourceGroups", "AnalysisMgrV2", "AsyncJobManager", "workloadSchedPolicy",

@@ -52,6 +52,21 @@ For crash testing, `RoutineLoadTaskExecutor.before_share_ack` blocks after Doris
 commit and before Kafka acknowledgement. Terminating that BE exercises redelivery.
 This implementation makes no exactly-once or performance claim.
 
+## Experimental completion metadata
+
+After upgrading all FEs, set `enable_kafka_source_completion_tracking=true` in
+`fe.conf` and restart to retain exact source completion metadata. Only commits
+carrying an exact source descriptor are tracked. This does not enable exactly-once
+ingestion or change Kafka acknowledgements.
+
+The FE limits source partitions, offset ranges, identity bytes, and pending commits
+with `kafka_source_completion_max_partitions`, `kafka_source_completion_max_ranges`,
+`kafka_source_completion_max_identity_bytes`, and
+`kafka_source_completion_max_pending_transactions`. Capacity exhaustion rejects
+new tracked commits before COMMITTED. Quota changes require a restart. Existing
+facts survive lower limits, disabled tracking, and transaction/job cleanup; this
+phase has no automatic metadata retirement. Missing history remains unknown.
+
 ## Kafka trunk regression
 
 Use a disposable non-cloud Doris cluster with debug points enabled, a Kafka trunk
