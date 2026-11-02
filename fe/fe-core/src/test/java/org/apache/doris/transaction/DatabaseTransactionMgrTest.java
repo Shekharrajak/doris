@@ -39,6 +39,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.io.CountingDataOutputStream;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.common.util.MetaLockUtils;
 import org.apache.doris.common.util.TimeUtils;
@@ -51,6 +52,7 @@ import org.apache.doris.load.DeleteInfo;
 import org.apache.doris.load.DeleteJob;
 import org.apache.doris.load.routineload.RLTaskTxnCommitAttachment;
 import org.apache.doris.load.routineload.kafka.KafkaRoutineLoadJob;
+import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionLedger;
 import org.apache.doris.meta.MetaContext;
 import org.apache.doris.mtmv.ivm.IvmInfo;
 import org.apache.doris.mysql.authenticate.TestLogAppender;
@@ -88,6 +90,9 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -97,6 +102,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
@@ -1208,23 +1214,53 @@ public class DatabaseTransactionMgrTest {
         return GlobalTransactionMgrTest.generateTabletCommitInfos(CatalogTestUtil.testTabletId1, allBackends);
     }
 
+    private KafkaSourceCompletionLedger sourceLedger(Env target, int partitions, int ranges, long identityBytes,
+            int pendingTransactions) {
+        KafkaSourceCompletionLedger ledger = new KafkaSourceCompletionLedger(
+                partitions, ranges, identityBytes, pendingTransactions);
+        Deencapsulation.setField(target, "kafkaSourceCompletionLedger", ledger);
+        return ledger;
+    }
+
+    private void finishSourceTransaction(TransactionState state) throws UserException {
+        long version = state.getTableCommitInfo(CatalogTestUtil.testTableId1).getIdToPartitionCommitInfo()
+                .get(CatalogTestUtil.testPartitionId1).getVersion();
+        Map<String, Map<Long, Long>> tablets = new HashMap<>();
+        setSuccessTablet(tablets, allBackends, state.getTransactionId(), CatalogTestUtil.testTabletId1, version);
+        setTransactionFinishPublish(state, allBackends, tablets);
+        masterTransMgr.finishTransaction(state.getDbId(), state.getTransactionId(),
+                Maps.newHashMap(), Maps.newHashMap());
+        Assertions.assertEquals(TransactionStatus.VISIBLE, state.getTransactionStatus());
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     public void testKafkaSourceCommitRetryPreservesIdentity(boolean logOutsideLock) throws Exception {
         boolean originalLogOutsideLock = Config.enable_txn_log_outside_lock;
+        boolean originalTracking = Config.enable_kafka_source_completion_tracking;
         try {
             Config.enable_txn_log_outside_lock = logOutsideLock;
+            Config.enable_kafka_source_completion_tracking = true;
             TransactionState state = sourceTransaction();
+            KafkaSourceCompletionLedger ledger = sourceLedger(masterEnv, 10, 100, 10000, 10);
             DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
             RLTaskTxnCommitAttachment attachment = sourceAttachment(state, 10);
             List<Table> tables = sourceTables();
             manager.commitTransaction(tables, state.getTransactionId(), sourceCommitInfos(), attachment, false);
             Assertions.assertDoesNotThrow(state::awaitKafkaSourceCommitDurability);
             Assertions.assertSame(attachment, state.getTxnCommitAttachment());
+            Assertions.assertTrue(state.isKafkaSourceCompletionTracked());
+            Assertions.assertEquals(Optional.of(attachment.getKafkaSourceDescriptor()),
+                    ledger.getCompleted(attachment.getKafkaSourceDescriptor()));
+            Assertions.assertEquals(0, ledger.getPendingTransactionCount());
 
             Mockito.clearInvocations(masterEnv.getEditLog());
             manager.commitTransaction(tables, state.getTransactionId(), sourceCommitInfos(),
                     sourceAttachment(state, 10), false);
+            Assertions.assertTrue(state.isKafkaSourceCompletionTracked());
+            Assertions.assertEquals(Optional.of(attachment.getKafkaSourceDescriptor()),
+                    ledger.getCompleted(attachment.getKafkaSourceDescriptor()));
+            Assertions.assertEquals(0, ledger.getPendingTransactionCount());
             Assertions.assertThrows(TransactionCommitFailedException.class,
                     () -> manager.commitTransaction(tables, state.getTransactionId(), sourceCommitInfos(),
                             sourceAttachment(state, 11), false));
@@ -1235,6 +1271,79 @@ public class DatabaseTransactionMgrTest {
             Mockito.verifyNoInteractions(masterEnv.getEditLog());
         } finally {
             Config.enable_txn_log_outside_lock = originalLogOutsideLock;
+            Config.enable_kafka_source_completion_tracking = originalTracking;
+        }
+    }
+
+    @Test
+    public void testKafkaSourceCompletionTrackingDisabledDoesNotReserveOrReplay() throws Exception {
+        boolean originalTracking = Config.enable_kafka_source_completion_tracking;
+        try {
+            Config.enable_kafka_source_completion_tracking = false;
+            TransactionState state = sourceTransaction();
+            KafkaSourceCompletionLedger ledger = sourceLedger(masterEnv, 0, 0, 0, 0);
+            DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+            manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                    sourceAttachment(state, 10), false);
+            Assertions.assertFalse(state.isKafkaSourceCompletionTracked());
+            Assertions.assertEquals(0, ledger.getPendingTransactionCount());
+            Assertions.assertTrue(ledger.snapshot().isEmpty());
+
+            Config.enable_kafka_source_completion_tracking = true;
+            TransactionState replay = GsonUtils.GSON.fromJson(GsonUtils.GSON.toJson(state), TransactionState.class);
+            manager.replayUpsertTransactionState(replay);
+            Assertions.assertTrue(ledger.snapshot().isEmpty());
+            Assertions.assertDoesNotThrow(replay::awaitKafkaSourceCommitDurability);
+        } finally {
+            Config.enable_kafka_source_completion_tracking = originalTracking;
+        }
+    }
+
+    @Test
+    public void testKafkaSourceCompletionQuotaFailsBeforeCommit() throws Exception {
+        boolean originalTracking = Config.enable_kafka_source_completion_tracking;
+        try {
+            Config.enable_kafka_source_completion_tracking = true;
+            TransactionState state = sourceTransaction();
+            KafkaSourceCompletionLedger ledger = sourceLedger(masterEnv, 0, 0, 0, 0);
+            DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+            Mockito.clearInvocations(masterEnv.getEditLog());
+            Assertions.assertThrows(TransactionCommitFailedException.class,
+                    () -> manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                            sourceAttachment(state, 10), false));
+            Assertions.assertEquals(TransactionStatus.PREPARE, state.getTransactionStatus());
+            Assertions.assertFalse(state.isKafkaSourceCompletionTracked());
+            Assertions.assertTrue(state.getIdToTableCommitInfos().isEmpty());
+            Assertions.assertEquals(0, ledger.getPendingTransactionCount());
+            Assertions.assertTrue(ledger.snapshot().isEmpty());
+            Mockito.verifyNoInteractions(masterEnv.getEditLog());
+        } finally {
+            Config.enable_kafka_source_completion_tracking = originalTracking;
+        }
+    }
+
+    @Test
+    public void testKafkaSourcePrepareFailureReleasesCompletionReservation() throws Exception {
+        boolean originalTracking = Config.enable_kafka_source_completion_tracking;
+        try {
+            Config.enable_kafka_source_completion_tracking = true;
+            TransactionState state = sourceTransaction();
+            KafkaSourceCompletionLedger ledger = sourceLedger(masterEnv, 10, 100, 10000, 10);
+            DatabaseTransactionMgr manager = Mockito.spy(masterTransMgr.getDatabaseTransactionMgr(state.getDbId()));
+            IllegalStateException failure = new IllegalStateException("before COMMITTED");
+            Mockito.doThrow(failure).when(manager).unprotectedCommitTransaction(Mockito.same(state), Mockito.anySet(),
+                    Mockito.anyMap(), Mockito.anySet(), Mockito.any(Database.class), Mockito.anyLong());
+            Mockito.clearInvocations(masterEnv.getEditLog());
+            Assertions.assertSame(failure, Assertions.assertThrows(IllegalStateException.class,
+                    () -> manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                            sourceAttachment(state, 10), false)));
+            Assertions.assertEquals(TransactionStatus.PREPARE, state.getTransactionStatus());
+            Assertions.assertFalse(state.isKafkaSourceCompletionTracked());
+            Assertions.assertEquals(0, ledger.getPendingTransactionCount());
+            Assertions.assertTrue(ledger.snapshot().isEmpty());
+            Mockito.verifyNoInteractions(masterEnv.getEditLog());
+        } finally {
+            Config.enable_kafka_source_completion_tracking = originalTracking;
         }
     }
 
@@ -1242,6 +1351,7 @@ public class DatabaseTransactionMgrTest {
     @ValueSource(booleans = {false, true})
     public void testKafkaSourceRetryWaitsForNativeJournal(boolean innerRetry) throws Exception {
         boolean originalLogOutsideLock = Config.enable_txn_log_outside_lock;
+        boolean originalTracking = Config.enable_kafka_source_completion_tracking;
         CountDownLatch journalEntered = new CountDownLatch(1);
         CountDownLatch releaseJournal = new CountDownLatch(1);
         CountDownLatch firstBeforeCommit = new CountDownLatch(1);
@@ -1250,7 +1360,9 @@ public class DatabaseTransactionMgrTest {
         List<Thread> threads = new ArrayList<>();
         try {
             Config.enable_txn_log_outside_lock = true;
+            Config.enable_kafka_source_completion_tracking = true;
             TransactionState state = sourceTransaction();
+            KafkaSourceCompletionLedger ledger = sourceLedger(masterEnv, 10, 100, 10000, 10);
             DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
             RLTaskTxnCommitAttachment attachment = sourceAttachment(state, 10);
             List<Table> tables = sourceTables();
@@ -1273,6 +1385,9 @@ public class DatabaseTransactionMgrTest {
             Mockito.doAnswer(invocation -> {
                 Assertions.assertFalse(Thread.holdsLock(state));
                 Mockito.verify(callback).afterCommitted(state, true);
+                Assertions.assertTrue(state.isKafkaSourceCompletionTracked());
+                Assertions.assertEquals(1, ledger.getPendingTransactionCount());
+                Assertions.assertTrue(ledger.snapshot().isEmpty());
                 journalEntered.countDown();
                 Assertions.assertTrue(releaseJournal.await(10, TimeUnit.SECONDS));
                 return 1L;
@@ -1303,6 +1418,12 @@ public class DatabaseTransactionMgrTest {
             threads.add(ownerThread);
             ownerThread.start();
             Assertions.assertTrue(journalEntered.await(10, TimeUnit.SECONDS));
+            Assertions.assertTrue(ledger.getCompleted(attachment.getKafkaSourceDescriptor()).isEmpty());
+            Assertions.assertThrows(IllegalStateException.class,
+                    () -> manager.unprotectUpsertTransactionState(state, true));
+            Assertions.assertEquals(1, ledger.getPendingTransactionCount());
+            Assertions.assertTrue(ledger.snapshot().isEmpty());
+            Config.enable_kafka_source_completion_tracking = false;
             TxnCommitAttachment boundAttachment = state.getTxnCommitAttachment();
             if (innerRetry) {
                 releaseFirstBeforeCommit.countDown();
@@ -1326,6 +1447,9 @@ public class DatabaseTransactionMgrTest {
             releaseJournal.countDown();
             owner.get(10, TimeUnit.SECONDS);
             retry.get(10, TimeUnit.SECONDS);
+            Assertions.assertEquals(Optional.of(attachment.getKafkaSourceDescriptor()),
+                    ledger.getCompleted(attachment.getKafkaSourceDescriptor()));
+            Assertions.assertEquals(0, ledger.getPendingTransactionCount());
             Mockito.verify(item).await();
         } finally {
             releaseFirstBeforeCommit.countDown();
@@ -1334,6 +1458,7 @@ public class DatabaseTransactionMgrTest {
                 thread.join(10000);
             }
             Config.enable_txn_log_outside_lock = originalLogOutsideLock;
+            Config.enable_kafka_source_completion_tracking = originalTracking;
         }
     }
 
@@ -1341,9 +1466,12 @@ public class DatabaseTransactionMgrTest {
     @ValueSource(booleans = {false, true})
     public void testKafkaSourceJournalFailureCannotBecomeRetrySuccess(boolean enqueueFailure) throws Exception {
         boolean originalLogOutsideLock = Config.enable_txn_log_outside_lock;
+        boolean originalTracking = Config.enable_kafka_source_completion_tracking;
         try {
             Config.enable_txn_log_outside_lock = true;
+            Config.enable_kafka_source_completion_tracking = true;
             TransactionState state = sourceTransaction();
+            KafkaSourceCompletionLedger ledger = sourceLedger(masterEnv, 10, 100, 10000, 10);
             DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
             RLTaskTxnCommitAttachment attachment = sourceAttachment(state, 10);
             EditLog.EditLogItem item = Mockito.mock(EditLog.EditLogItem.class);
@@ -1359,11 +1487,24 @@ public class DatabaseTransactionMgrTest {
                     () -> manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
                             attachment, false));
             Assertions.assertEquals(TransactionStatus.COMMITTED, state.getTransactionStatus());
+            Assertions.assertTrue(state.isKafkaSourceCompletionTracked());
+            Assertions.assertEquals(1, ledger.getPendingTransactionCount());
+            Assertions.assertTrue(ledger.snapshot().isEmpty());
             Assertions.assertThrows(TransactionCommitFailedException.class,
                     () -> manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
                             attachment, false));
+            Assertions.assertThrows(IllegalStateException.class, () -> manager.replayUpsertTransactionState(state));
+            Assertions.assertEquals(1, ledger.getPendingTransactionCount());
+            Assertions.assertTrue(ledger.snapshot().isEmpty());
+            TransactionState replay = GsonUtils.GSON.fromJson(GsonUtils.GSON.toJson(state), TransactionState.class);
+            manager.replayUpsertTransactionState(replay);
+            Assertions.assertEquals(0, ledger.getPendingTransactionCount());
+            Assertions.assertEquals(Optional.of(attachment.getKafkaSourceDescriptor()),
+                    ledger.getCompleted(attachment.getKafkaSourceDescriptor()));
+            Assertions.assertDoesNotThrow(replay::awaitKafkaSourceCommitDurability);
         } finally {
             Config.enable_txn_log_outside_lock = originalLogOutsideLock;
+            Config.enable_kafka_source_completion_tracking = originalTracking;
         }
     }
 
@@ -1409,21 +1550,93 @@ public class DatabaseTransactionMgrTest {
 
     @Test
     public void testKafkaSourceReplayAndImageRestoreDurableCommit() throws Exception {
-        TransactionState state = sourceTransaction();
-        DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
-        manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
-                sourceAttachment(state, 10), false);
-        String snapshot = GsonUtils.GSON.toJson(state);
-        TransactionState image = GsonUtils.GSON.fromJson(snapshot, TransactionState.class);
-        Assertions.assertThrows(TransactionCommitFailedException.class, image::awaitKafkaSourceCommitDurability);
-        FakeEnv.setEnv(slaveEnv);
-        DatabaseTransactionMgr restored = slaveTransMgr.getDatabaseTransactionMgr(state.getDbId());
-        restored.unprotectUpsertTransactionState(image, true);
-        Assertions.assertDoesNotThrow(image::awaitKafkaSourceCommitDurability);
+        boolean originalTracking = Config.enable_kafka_source_completion_tracking;
+        try {
+            Config.enable_kafka_source_completion_tracking = true;
+            TransactionState state = sourceTransaction();
+            sourceLedger(masterEnv, 10, 100, 10000, 10);
+            DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+            manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                    sourceAttachment(state, 10), false);
+            String snapshot = GsonUtils.GSON.toJson(state);
+            Config.enable_kafka_source_completion_tracking = false;
+            TransactionState image = GsonUtils.GSON.fromJson(snapshot, TransactionState.class);
+            Assertions.assertTrue(image.isKafkaSourceCompletionTracked());
+            Assertions.assertThrows(TransactionCommitFailedException.class, image::awaitKafkaSourceCommitDurability);
+            FakeEnv.setEnv(slaveEnv);
+            KafkaSourceCompletionLedger ledger = sourceLedger(slaveEnv, 0, 0, 0, 0);
+            DatabaseTransactionMgr restored = slaveTransMgr.getDatabaseTransactionMgr(state.getDbId());
+            TransactionState invalid = GsonUtils.GSON.fromJson(snapshot, TransactionState.class);
+            invalid.setCallbackId(state.getCallbackId() + 1);
+            Assertions.assertThrows(IllegalStateException.class,
+                    () -> restored.unprotectUpsertTransactionState(invalid, true));
+            Assertions.assertTrue(ledger.snapshot().isEmpty());
+            TransactionState missingSource = GsonUtils.GSON.fromJson(snapshot, TransactionState.class);
+            Deencapsulation.setField(missingSource.getTxnCommitAttachment(), "kafkaSourceDescriptor", null);
+            Assertions.assertThrows(IllegalStateException.class,
+                    () -> restored.unprotectUpsertTransactionState(missingSource, true));
+            Assertions.assertTrue(ledger.snapshot().isEmpty());
+            restored.unprotectUpsertTransactionState(image, true);
+            Assertions.assertDoesNotThrow(image::awaitKafkaSourceCommitDurability);
+            Assertions.assertEquals(Optional.of(state.getKafkaSourceDescriptor()),
+                    ledger.getCompleted(state.getKafkaSourceDescriptor()));
 
-        TransactionState replay = GsonUtils.GSON.fromJson(snapshot, TransactionState.class);
-        restored.replayUpsertTransactionState(replay);
-        Assertions.assertDoesNotThrow(replay::awaitKafkaSourceCommitDurability);
+            TransactionState replay = GsonUtils.GSON.fromJson(snapshot, TransactionState.class);
+            restored.replayUpsertTransactionState(replay);
+            Assertions.assertDoesNotThrow(replay::awaitKafkaSourceCommitDurability);
+            Assertions.assertEquals(1, ledger.snapshot().size());
+            Assertions.assertEquals(0, ledger.getPendingTransactionCount());
+        } finally {
+            Config.enable_kafka_source_completion_tracking = originalTracking;
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"label", "ttl", "count"})
+    public void testKafkaSourceCompletionSurvivesTransactionCleanupAndEnvImage(String cleanup) throws Exception {
+        boolean originalTracking = Config.enable_kafka_source_completion_tracking;
+        int originalStreamingKeep = Config.streaming_label_keep_max_second;
+        int originalLabelCount = Config.label_num_threshold;
+        try {
+            Config.enable_kafka_source_completion_tracking = true;
+            TransactionState state = sourceTransaction();
+            KafkaSourceCompletionLedger ledger = sourceLedger(masterEnv, 10, 100, 10000, 10);
+            DatabaseTransactionMgr manager = masterTransMgr.getDatabaseTransactionMgr(state.getDbId());
+            manager.commitTransaction(sourceTables(), state.getTransactionId(), sourceCommitInfos(),
+                    sourceAttachment(state, 10), false);
+            finishSourceTransaction(state);
+            if (cleanup.equals("label")) {
+                manager.cleanLabel(state.getLabel(), false);
+            } else if (cleanup.equals("ttl")) {
+                Config.streaming_label_keep_max_second = -1;
+                manager.removeUselessTxns(System.currentTimeMillis());
+            } else {
+                TransactionState next = manager.getTransactionState(LabelToTxnId.get(CatalogTestUtil.testTxnLabel3));
+                manager.commitTransaction(sourceTables(), next.getTransactionId(), sourceCommitInfos(), null, false);
+                finishSourceTransaction(next);
+                Config.label_num_threshold = 1;
+                manager.removeUselessTxns(System.currentTimeMillis());
+            }
+            Assertions.assertNull(manager.getTransactionState(state.getTransactionId()));
+            Assertions.assertEquals(Optional.of(state.getKafkaSourceDescriptor()),
+                    ledger.getCompleted(state.getKafkaSourceDescriptor()));
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (CountingDataOutputStream output = new CountingDataOutputStream(bytes)) {
+                masterEnv.saveKafkaSourceCompletions(output, 0);
+            }
+            Config.enable_kafka_source_completion_tracking = false;
+            KafkaSourceCompletionLedger restored = sourceLedger(slaveEnv, 0, 0, 0, 0);
+            try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+                slaveEnv.loadKafkaSourceCompletions(input, 0);
+            }
+            Assertions.assertEquals(ledger.snapshot(), restored.snapshot());
+            Assertions.assertEquals(0, restored.getPendingTransactionCount());
+            Assertions.assertNull(slaveTransMgr.getTransactionState(state.getDbId(), state.getTransactionId()));
+        } finally {
+            Config.enable_kafka_source_completion_tracking = originalTracking;
+            Config.streaming_label_keep_max_second = originalStreamingKeep;
+            Config.label_num_threshold = originalLabelCount;
+        }
     }
 
     @ParameterizedTest

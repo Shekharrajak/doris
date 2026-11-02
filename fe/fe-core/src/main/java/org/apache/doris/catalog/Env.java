@@ -149,6 +149,7 @@ import org.apache.doris.load.loadv2.ProgressManager;
 import org.apache.doris.load.routineload.RoutineLoadManager;
 import org.apache.doris.load.routineload.RoutineLoadScheduler;
 import org.apache.doris.load.routineload.RoutineLoadTaskScheduler;
+import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionLedger;
 import org.apache.doris.master.Checkpoint;
 import org.apache.doris.master.MetaHelper;
 import org.apache.doris.master.PartitionInfoCollector;
@@ -500,6 +501,9 @@ public class Env {
     private StorageVaultMgr storageVaultMgr;
 
     private GlobalTransactionMgrIface globalTransactionMgr;
+    private final KafkaSourceCompletionLedger kafkaSourceCompletionLedger = new KafkaSourceCompletionLedger(
+            Config.kafka_source_completion_max_partitions, Config.kafka_source_completion_max_ranges,
+            Config.kafka_source_completion_max_identity_bytes, Config.kafka_source_completion_max_pending_transactions);
 
     private DeployManager deployManager;
 
@@ -989,6 +993,10 @@ public class Env {
 
     public GlobalTransactionMgrIface getGlobalTransactionMgr() {
         return globalTransactionMgr;
+    }
+
+    public KafkaSourceCompletionLedger getKafkaSourceCompletionLedger() {
+        return kafkaSourceCompletionLedger;
     }
 
     public PluginMgr getPluginMgr() {
@@ -2413,6 +2421,7 @@ public class Env {
     }
 
     public void loadImage(String imageDir) throws IOException, DdlException {
+        kafkaSourceCompletionLedger.resetForImageLoad();
         Storage storage = new Storage(imageDir);
         getClusterIdFromStorage(storage);
         File curFile = storage.getCurrentImageFile();
@@ -2590,6 +2599,11 @@ public class Env {
         // CAN NOT use Auth.read(), cause this auth instance is already passed to DomainResolver
         auth.readFields(dis);
         LOG.info("finished replay auth from image");
+        return checksum;
+    }
+
+    public long loadKafkaSourceCompletions(DataInputStream dis, long checksum) throws IOException {
+        kafkaSourceCompletionLedger.readFields(dis);
         return checksum;
     }
 
@@ -2964,6 +2978,13 @@ public class Env {
 
     public long saveAuth(CountingDataOutputStream dos, long checksum) throws IOException {
         auth.write(dos);
+        return checksum;
+    }
+
+    public long saveKafkaSourceCompletions(CountingDataOutputStream dos, long checksum) throws IOException {
+        if (kafkaSourceCompletionLedger.hasCompletions()) {
+            kafkaSourceCompletionLedger.write(dos);
+        }
         return checksum;
     }
 

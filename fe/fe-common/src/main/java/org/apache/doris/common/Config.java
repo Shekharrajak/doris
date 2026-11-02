@@ -1189,6 +1189,25 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true, masterOnly = true)
     public static int max_routine_load_task_num_per_be = 1024;
 
+    @ConfField(description = "Record native shared-nothing Routine Load Kafka source completion metadata; "
+            + "this does not enable exactly-once ingestion. Restart required.")
+    public static boolean enable_kafka_source_completion_tracking = false;
+
+    @ConfField(description = "Maximum retained Kafka source partitions, including pending capacity reservations. "
+            + "Restart required; recovery preserves facts recorded under older limits.")
+    public static int kafka_source_completion_max_partitions = 100000;
+
+    @ConfField(description = "Maximum retained Kafka source offset ranges, including pending capacity reservations. "
+            + "Restart required; recovery preserves facts recorded under older limits.")
+    public static int kafka_source_completion_max_ranges = 1000000;
+
+    @ConfField(description = "Maximum logical Kafka source identity bytes, including pending capacity reservations. "
+            + "Restart required; recovery preserves facts recorded under older limits.")
+    public static long kafka_source_completion_max_identity_bytes = 32L * 1024 * 1024;
+
+    @ConfField(description = "Maximum pending Kafka source completion transactions. Restart required.")
+    public static int kafka_source_completion_max_pending_transactions = 1024;
+
     /**
      * routine load timeout is equal to maxBatchIntervalS * routine_load_task_timeout_multiplier.
      */
