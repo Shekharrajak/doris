@@ -81,6 +81,7 @@ TLoadTxnCommitRequest request_for_log(const TLoadTxnCommitRequest& request) {
 TLoadTxnBeginResult k_stream_load_begin_result;
 TLoadTxnCommitResult k_stream_load_commit_result;
 TLoadTxnRollbackResult k_stream_load_rollback_result;
+TGetKafkaSourceCompletionsResult k_stream_load_source_completions_result;
 Status k_stream_load_plan_status;
 #endif
 
@@ -428,6 +429,59 @@ void StreamLoadExecutor::rollback_txn(StreamLoadContext* ctx) {
 #else
     result = k_stream_load_rollback_result;
 #endif
+}
+
+Status StreamLoadExecutor::get_kafka_source_completions(
+        StreamLoadContext* ctx, const TKafkaSourceDescriptor& source,
+        std::optional<TKafkaSourceDescriptor>* completed) {
+    completed->reset();
+    if (ctx->load_type != TLoadType::ROUTINE_LOAD || ctx->load_src_type != TLoadSourceType::KAFKA ||
+        !ctx->kafka_info || !ctx->kafka_info->use_share_consumer || ctx->is_multi_table ||
+        ctx->job_id <= 0 || ctx->txn_id <= 0 || ctx->auth.token.empty() ||
+        !source.__isset.namespaceId || source.namespaceId != ctx->job_id) {
+        return Status::InvalidArgument("Invalid Kafka source completion query context");
+    }
+    int64_t db_id = ctx->db_id;
+    if (db_id <= 0) {
+        const auto& params = ctx->put_result.pipeline_params;
+        if (!params.__isset.fragment || !params.fragment.__isset.output_sink ||
+            !params.fragment.output_sink.__isset.olap_table_sink) {
+            return Status::InvalidArgument("Kafka source completion query has no database ID");
+        }
+        const auto& sink = params.fragment.output_sink.olap_table_sink;
+        if (sink.txn_id != ctx->txn_id || sink.db_id <= 0) {
+            return Status::InvalidArgument(
+                    "Kafka source completion query has an invalid load sink");
+        }
+        db_id = sink.db_id;
+    }
+    TGetKafkaSourceCompletionsRequest request;
+    request.__set_db_id(db_id);
+    request.__set_txn_id(ctx->txn_id);
+    request.__set_job_id(ctx->job_id);
+    request.__set_task_id(ctx->id.to_thrift());
+    request.__set_source(source);
+    request.__set_token(ctx->auth.token);
+    TGetKafkaSourceCompletionsResult result;
+#ifndef BE_TEST
+    auto master_addr_provider = [this]() { return _exec_env->cluster_info()->master_fe_addr; };
+    RETURN_IF_ERROR(ThriftRpcHelper::rpc<FrontendServiceClient>(
+            master_addr_provider,
+            [&request, &result](FrontendServiceConnection& client) {
+                client->getKafkaSourceCompletions(result, request);
+            },
+            config::thrift_rpc_timeout_ms));
+#else
+    result = k_stream_load_source_completions_result;
+#endif
+    if (!result.__isset.status) {
+        return Status::InternalError("Kafka source completion response has no status");
+    }
+    RETURN_IF_ERROR(Status::create(result.status));
+    if (result.__isset.completed_source) {
+        *completed = std::move(result.completed_source);
+    }
+    return Status::OK();
 }
 
 bool StreamLoadExecutor::collect_load_stat(StreamLoadContext* ctx, TTxnCommitAttachment* attach) {

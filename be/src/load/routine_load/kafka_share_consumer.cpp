@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
 #include <limits>
 #include <tuple>
 #include <utility>
@@ -30,6 +31,7 @@
 #include "io/fs/stream_load_pipe.h"
 #include "load/routine_load/consumer_group_helpers.h"
 #include "load/routine_load/kafka_reader_telemetry.h"
+#include "runtime/exec_env.h"
 #include "runtime/thread_context.h"
 #include "util/defer_op.h"
 #include "util/stopwatch.hpp"
@@ -51,6 +53,79 @@ Status share_status(rd_kafka_error_t* error) {
     rd_kafka_error_destroy(error);
     return status;
 }
+
+auto source_partition_key(const TKafkaSourcePartition& partition) {
+    return std::tuple(std::bit_cast<uint64_t>(partition.topicId.hi),
+                      std::bit_cast<uint64_t>(partition.topicId.lo), partition.partition);
+}
+
+Status validate_completed_source(const TKafkaSourceDescriptor& query,
+                                 const TKafkaSourceDescriptor& completed) {
+    if (!completed.__isset.namespaceId || completed.namespaceId != query.namespaceId ||
+        !completed.__isset.clusterId || completed.clusterId != query.clusterId ||
+        !completed.__isset.partitions || completed.partitions.empty()) {
+        return Status::InternalError("Invalid Kafka source completion descriptor");
+    }
+    size_t query_index = 0;
+    for (size_t i = 0; i < completed.partitions.size(); ++i) {
+        const auto& partition = completed.partitions[i];
+        if (!partition.__isset.topicId ||
+            (partition.topicId.hi == 0 && partition.topicId.lo == 0) ||
+            !partition.__isset.partition || partition.partition < 0 || !partition.__isset.ranges ||
+            partition.ranges.empty() ||
+            (i != 0 && source_partition_key(completed.partitions[i - 1]) >=
+                               source_partition_key(partition))) {
+            return Status::InternalError("Noncanonical Kafka source completion partition");
+        }
+        while (query_index < query.partitions.size() &&
+               source_partition_key(query.partitions[query_index]) <
+                       source_partition_key(partition)) {
+            ++query_index;
+        }
+        if (query_index == query.partitions.size() ||
+            source_partition_key(query.partitions[query_index]) !=
+                    source_partition_key(partition)) {
+            return Status::InternalError("Kafka source completion is outside the query");
+        }
+        const auto& query_ranges = query.partitions[query_index].ranges;
+        size_t range_index = 0;
+        for (size_t j = 0; j < partition.ranges.size(); ++j) {
+            const auto& range = partition.ranges[j];
+            if (!range.__isset.first || !range.__isset.last || range.first < 0 ||
+                range.last < range.first ||
+                (j != 0 && (partition.ranges[j - 1].last == std::numeric_limits<int64_t>::max() ||
+                            range.first <= partition.ranges[j - 1].last + 1))) {
+                return Status::InternalError("Noncanonical Kafka source completion range");
+            }
+            while (range_index < query_ranges.size() &&
+                   query_ranges[range_index].last < range.first) {
+                ++range_index;
+            }
+            if (range_index == query_ranges.size() ||
+                query_ranges[range_index].first > range.first ||
+                query_ranges[range_index].last < range.last) {
+                return Status::InternalError("Kafka source completion is outside the query");
+            }
+        }
+    }
+    return Status::OK();
+}
+
+bool source_completed(const TKafkaSourceDescriptor& completed,
+                      const KafkaShareBatch::Record& record) {
+    auto key = std::tuple(record.topic_id_hi, record.topic_id_lo, record.partition);
+    auto partition = std::lower_bound(completed.partitions.begin(), completed.partitions.end(), key,
+                                      [](const auto& value, const auto& target) {
+                                          return source_partition_key(value) < target;
+                                      });
+    if (partition == completed.partitions.end() || source_partition_key(*partition) != key) {
+        return false;
+    }
+    auto range =
+            std::lower_bound(partition->ranges.begin(), partition->ranges.end(), record.offset,
+                             [](const auto& value, int64_t offset) { return value.last < offset; });
+    return range != partition->ranges.end() && range->first <= record.offset;
+}
 } // namespace
 
 KafkaShareBatch::KafkaShareBatch()
@@ -70,12 +145,54 @@ void KafkaShareBatch::reserve(size_t count) {
 void KafkaShareBatch::add_record(int32_t partition, int64_t offset) {
     // reserve() binds capacity allocations to the batch tracker before appending.
     DCHECK_LT(_records.size(), _records.capacity());
-    _records.emplace_back(partition, offset);
+    _records.push_back(
+            {.partition = partition, .offset = offset, .representative = _records.size()});
 }
 
-void KafkaShareBatch::mark_processed() {
-    DCHECK_LT(_processed, _records.size());
+void KafkaShareBatch::set_topic_id(size_t index, uint64_t hi, uint64_t lo) {
+    _records[index].topic_id_hi = hi;
+    _records[index].topic_id_lo = lo;
+}
+
+void KafkaShareBatch::mark_done(size_t index) {
+    DCHECK(_records[index].disposition == Disposition::UNTOUCHED ||
+           _records[index].disposition == Disposition::DUPLICATE);
+    _records[index].disposition = Disposition::DURABLE_DONE;
+}
+
+void KafkaShareBatch::mark_appended(size_t index) {
+    DCHECK(_records[index].disposition == Disposition::UNTOUCHED);
+    _records[index].disposition = Disposition::APPENDED;
     ++_processed;
+}
+
+void KafkaShareBatch::mark_duplicate(size_t index, size_t representative) {
+    DCHECK_LT(representative, index);
+    DCHECK(_records[representative].disposition != Disposition::DUPLICATE);
+    DCHECK(_records[index].disposition == Disposition::UNTOUCHED);
+    _records[index].disposition = Disposition::DUPLICATE;
+    _records[index].representative = representative;
+}
+
+bool KafkaShareBatch::should_accept(size_t index, bool committed) const {
+    const auto& record = _records[index];
+    auto disposition = record.disposition == Disposition::DUPLICATE
+                               ? _records[record.representative].disposition
+                               : record.disposition;
+    return disposition == Disposition::DURABLE_DONE ||
+           (committed && disposition == Disposition::APPENDED);
+}
+
+bool KafkaShareBatch::all_records_completed() const {
+    if (empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < size(); ++i) {
+        if (!should_accept(i, false)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void KafkaShareBatch::clear() {
@@ -103,6 +220,12 @@ KafkaShareConsumer::~KafkaShareConsumer() {
 }
 
 Status KafkaShareConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
+#ifndef HAVE_RDKAFKA_MESSAGE_TOPIC_ID
+    if (config::enable_kafka_share_completion_filtering) {
+        return Status::InternalError(
+                "Kafka share completion filtering requires the topic identity API");
+    }
+#endif
     _brokers = ctx->kafka_info->brokers;
     _topic = ctx->kafka_info->topic;
     _properties = ctx->kafka_info->properties;
@@ -162,11 +285,16 @@ Status KafkaShareConsumer::init(std::shared_ptr<StreamLoadContext> ctx) {
 
 Status KafkaShareConsumer::consume(std::shared_ptr<StreamLoadContext> ctx) {
     DCHECK(_batch.empty());
+    const bool filtering = config::enable_kafka_share_completion_filtering;
     ctx->kafka_info->source_descriptor.reset();
-    KafkaReaderTelemetry telemetry(ctx->job_id, _id, true);
+#ifndef HAVE_RDKAFKA_MESSAGE_TOPIC_ID
+    if (filtering) {
+        return Status::InternalError(
+                "Kafka share completion filtering requires the topic identity API");
+    }
+#endif
     rd_kafka_messages_t* batch = nullptr;
     Defer destroy_batch {[&] { rd_kafka_messages_destroy(batch); }};
-    auto pipe = std::static_pointer_cast<io::StreamLoadPipe>(ctx->body_sink);
     MonotonicStopWatch watch;
     watch.start();
     int64_t remaining_ms = ctx->max_interval_s * 1000;
@@ -177,27 +305,87 @@ Status KafkaShareConsumer::consume(std::shared_ptr<StreamLoadContext> ctx) {
                 _consumer, static_cast<int>(std::min<int64_t>(remaining_ms, 1000)), &batch)));
         remaining_ms = ctx->max_interval_s * 1000 - watch.elapsed_time() / 1000000;
     }
-    telemetry.timing("poll", watch.elapsed_time());
-    auto append = FormatAppender::get_append_function<io::StreamLoadPipe>(ctx->format);
-    int64_t bytes = 0;
-    size_t count = batch == nullptr ? 0 : rd_kafka_messages_count(batch);
-    share_received_records << count;
-    _batch.reserve(count);
+    const int64_t poll_ns = watch.elapsed_time();
+    const size_t count = batch == nullptr ? 0 : rd_kafka_messages_count(batch);
+    DorisVector<rd_kafka_message_t*> messages;
+    Defer free_messages {[&] {
+        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_batch.mem_tracker());
+        decltype(messages)().swap(messages);
+    }};
+    {
+        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_batch.mem_tracker());
+        messages.reserve(count);
+    }
     for (size_t i = 0; i < count; ++i) {
-        auto* message = rd_kafka_messages_get(batch, i);
+        messages.push_back(rd_kafka_messages_get(batch, i));
+    }
+    return consume_messages(ctx, messages, filtering, poll_ns);
+}
+
+Status KafkaShareConsumer::consume_messages(std::shared_ptr<StreamLoadContext> ctx,
+                                            std::span<rd_kafka_message_t* const> messages,
+                                            bool filtering, int64_t poll_ns) {
+    DCHECK(_batch.empty());
+    ctx->kafka_info->source_descriptor.reset();
+    KafkaReaderTelemetry telemetry(ctx->job_id, _id, true);
+    telemetry.timing("poll", poll_ns);
+    share_received_records << messages.size();
+    _batch.reserve(messages.size());
+    for (auto* message : messages) {
         _batch.add_record(message->partition, message->offset);
         if (telemetry.enabled() && message->err == RD_KAFKA_RESP_ERR_NO_ERROR) {
             telemetry.received(message->partition, UnixMillis());
         }
     }
     telemetry.flush();
+    std::string cluster_id;
+    if (filtering && !messages.empty()) {
+        for (auto* message : messages) {
+            if (message->err != RD_KAFKA_RESP_ERR_NO_ERROR) {
+                return Status::InternalError("Kafka share record error: {}",
+                                             rd_kafka_err2str(message->err));
+            }
+        }
+        RETURN_IF_ERROR(capture_source_identity(messages, false, &cluster_id));
+        RETURN_IF_ERROR(classify_records(messages));
+        auto query = build_source_descriptor(ctx->job_id, cluster_id, false);
+        if (!query.has_value()) {
+            return Status::InternalError("Missing Kafka share source identity");
+        }
+        std::optional<TKafkaSourceDescriptor> completed;
+        auto lookup_status = ctx->exec_env()->stream_load_executor()->get_kafka_source_completions(
+                ctx.get(), *query, &completed);
+        if (!lookup_status.ok()) {
+            return Status::InternalError("Kafka source completion lookup failed: {}",
+                                         lookup_status);
+        }
+        if (completed.has_value()) {
+            RETURN_IF_ERROR(validate_completed_source(*query, *completed));
+            for (size_t i = 0; i < messages.size(); ++i) {
+                if (source_completed(*completed, _batch.record(i))) {
+                    _batch.mark_done(i);
+                }
+            }
+        }
+        for (size_t i = 0; i < messages.size(); ++i) {
+            if (messages[i]->payload == nullptr && !_batch.should_accept(i, false)) {
+                return Status::InternalError("Uncompleted Kafka share record has a null payload");
+            }
+        }
+    }
+    auto pipe = std::static_pointer_cast<io::StreamLoadPipe>(ctx->body_sink);
+    auto append = FormatAppender::get_append_function<io::StreamLoadPipe>(ctx->format);
+    int64_t bytes = 0;
     const int64_t append_start = MonotonicNanos();
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < messages.size(); ++i) {
+        if (filtering && _batch.record(i).disposition != KafkaShareBatch::Disposition::UNTOUCHED) {
+            continue;
+        }
         if (std::cmp_greater_equal(_batch.processed(), ctx->max_batch_rows) ||
             bytes >= ctx->max_batch_size) {
             break;
         }
-        auto* message = rd_kafka_messages_get(batch, i);
+        auto* message = messages[i];
         if (message->err != RD_KAFKA_RESP_ERR_NO_ERROR) {
             return Status::InternalError("Kafka share record error: {}",
                                          rd_kafka_err2str(message->err));
@@ -206,63 +394,116 @@ Status KafkaShareConsumer::consume(std::shared_ptr<StreamLoadContext> ctx) {
             RETURN_IF_ERROR((pipe.get()->*append)(static_cast<const char*>(message->payload),
                                                   message->len));
         }
-        _batch.mark_processed();
+        _batch.mark_appended(i);
         bytes += message->len;
     }
     telemetry.timing("append", MonotonicNanos() - append_start);
     ctx->receive_bytes = bytes;
     DorisMetrics::instance()->routine_load_consume_rows->increment(_batch.processed());
     DorisMetrics::instance()->routine_load_consume_bytes->increment(bytes);
-    capture_source_descriptor(ctx.get(), batch);
+    if (!filtering && _batch.processed() != 0) {
+        if (!capture_source_identity(messages, true, &cluster_id).ok()) {
+            cluster_id.clear();
+        }
+    }
+    ctx->kafka_info->source_descriptor = build_source_descriptor(ctx->job_id, cluster_id, true);
     return pipe->finish();
 }
 
-void KafkaShareConsumer::capture_source_descriptor(StreamLoadContext* ctx,
-                                                   [[maybe_unused]] rd_kafka_messages_t* messages) {
-    ctx->kafka_info->source_descriptor.reset();
+Status KafkaShareConsumer::capture_source_identity(
+        [[maybe_unused]] std::span<rd_kafka_message_t* const> messages,
+        [[maybe_unused]] bool appended_only, [[maybe_unused]] std::string* cluster_id) {
 #ifdef HAVE_RDKAFKA_MESSAGE_TOPIC_ID
-    if (_batch.processed() == 0) {
-        return;
+    if (_client == nullptr) {
+        return Status::InternalError("Missing Kafka share client identity");
     }
-    char* cluster_id = rd_kafka_clusterid(_client, 0);
-    if (cluster_id == nullptr) {
-        return;
+    char* native_cluster_id = rd_kafka_clusterid(_client, 0);
+    if (native_cluster_id == nullptr) {
+        return Status::InternalError("Missing Kafka share cluster identity");
     }
-    Defer free_cluster_id {[&] { rd_kafka_mem_free(_client, cluster_id); }};
-    std::vector<TopicId> topic_ids;
-    topic_ids.reserve(_batch.processed());
-    for (size_t i = 0; i < _batch.processed(); ++i) {
-        auto* message = rd_kafka_messages_get(messages, i);
-        const auto* topic_id = rd_kafka_message_topic_id(message);
-        if (topic_id == nullptr) {
-            topic_ids.emplace_back(0, 0);
-        } else {
-            topic_ids.emplace_back(
-                    static_cast<uint64_t>(rd_kafka_Uuid_most_significant_bits(topic_id)),
-                    static_cast<uint64_t>(rd_kafka_Uuid_least_significant_bits(topic_id)));
+    Defer free_cluster_id {[&] { rd_kafka_mem_free(_client, native_cluster_id); }};
+    *cluster_id = native_cluster_id;
+    if (cluster_id->empty()) {
+        return Status::InternalError("Missing Kafka share cluster identity");
+    }
+    for (size_t i = 0; i < messages.size(); ++i) {
+        if (appended_only &&
+            _batch.record(i).disposition != KafkaShareBatch::Disposition::APPENDED) {
+            continue;
         }
+        const auto* topic_id = rd_kafka_message_topic_id(messages[i]);
+        if (topic_id == nullptr) {
+            return Status::InternalError("Missing Kafka share delivered topic identity");
+        }
+        auto hi = static_cast<uint64_t>(rd_kafka_Uuid_most_significant_bits(topic_id));
+        auto lo = static_cast<uint64_t>(rd_kafka_Uuid_least_significant_bits(topic_id));
+        if (hi == 0 && lo == 0) {
+            return Status::InternalError("Missing Kafka share delivered topic identity");
+        }
+        _batch.set_topic_id(i, hi, lo);
     }
-    ctx->kafka_info->source_descriptor =
-            build_source_descriptor(ctx->job_id, cluster_id, topic_ids);
+    return Status::OK();
+#else
+    return Status::InternalError(
+            "Kafka share completion filtering requires the topic identity API");
 #endif
 }
 
+Status KafkaShareConsumer::classify_records(std::span<rd_kafka_message_t* const> messages) {
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_batch.mem_tracker());
+    DorisMap<std::tuple<uint64_t, uint64_t, int32_t, int64_t>, size_t> representatives;
+    DorisMap<int32_t, TopicId> partition_topics;
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const auto& record = _batch.record(i);
+        const TopicId topic_id(record.topic_id_hi, record.topic_id_lo);
+        if ((topic_id.first == 0 && topic_id.second == 0) || record.partition < 0 ||
+            record.offset < 0) {
+            return Status::InternalError("Missing Kafka share source identity");
+        }
+        auto [topic, new_partition] = partition_topics.emplace(record.partition, topic_id);
+        if (!new_partition && topic->second != topic_id) {
+            return Status::InternalError(
+                    "Multiple Kafka topic identities for one acquired partition");
+        }
+        auto [representative, inserted] = representatives.emplace(
+                std::tuple(record.topic_id_hi, record.topic_id_lo, record.partition, record.offset),
+                i);
+        if (inserted) {
+            continue;
+        }
+        auto* original = messages[representative->second];
+        auto* duplicate = messages[i];
+        if ((original->payload == nullptr) != (duplicate->payload == nullptr) ||
+            original->len != duplicate->len ||
+            (original->payload != nullptr && original->len != 0 &&
+             std::memcmp(original->payload, duplicate->payload, original->len) != 0)) {
+            return Status::InternalError(
+                    "Inconsistent payloads for one Kafka share source identity");
+        }
+        _batch.mark_duplicate(i, representative->second);
+    }
+    return Status::OK();
+}
+
 std::optional<TKafkaSourceDescriptor> KafkaShareConsumer::build_source_descriptor(
-        int64_t namespace_id, const std::string& cluster_id,
-        const std::vector<TopicId>& topic_ids) const {
-    if (_batch.processed() == 0 || cluster_id.empty()) {
+        int64_t namespace_id, const std::string& cluster_id, bool appended_only) const {
+    if ((appended_only ? _batch.processed() == 0 : _batch.empty()) || cluster_id.empty()) {
         return std::nullopt;
     }
-    DCHECK_GE(topic_ids.size(), _batch.processed());
-    std::vector<std::tuple<uint64_t, uint64_t, int32_t, int64_t>> records;
-    records.reserve(_batch.processed());
-    for (size_t i = 0; i < _batch.processed(); ++i) {
-        const auto& [hi, lo] = topic_ids[i];
-        if (hi == 0 && lo == 0) {
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_batch.mem_tracker());
+    DorisVector<std::tuple<uint64_t, uint64_t, int32_t, int64_t>> records;
+    records.reserve(appended_only ? _batch.processed() : _batch.size());
+    for (size_t i = 0; i < _batch.size(); ++i) {
+        const auto& record = _batch.record(i);
+        if (appended_only && record.disposition != KafkaShareBatch::Disposition::APPENDED) {
+            continue;
+        }
+        if ((record.topic_id_hi == 0 && record.topic_id_lo == 0) || record.partition < 0 ||
+            record.offset < 0) {
             return std::nullopt;
         }
-        const auto& [partition, offset] = _batch.record(i);
-        records.emplace_back(hi, lo, partition, offset);
+        records.emplace_back(record.topic_id_hi, record.topic_id_lo, record.partition,
+                             record.offset);
     }
     std::sort(records.begin(), records.end());
     std::vector<TKafkaSourcePartition> partitions;
@@ -307,8 +548,8 @@ Status KafkaShareConsumer::acknowledge(bool committed) {
     bool staged = false;
     for (size_t i = 0; i < _batch.size(); ++i) {
         const auto& record = _batch.record(i);
-        auto st = acknowledge_record(record.first, record.second,
-                                     committed && i < _batch.processed());
+        auto st = acknowledge_record(record.partition, record.offset,
+                                     _batch.should_accept(i, committed));
         if (st.ok()) {
             staged = true;
         } else if (status.ok()) {

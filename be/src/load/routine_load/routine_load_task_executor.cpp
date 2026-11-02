@@ -564,11 +564,40 @@ void RoutineLoadTaskExecutor::exec_task(std::shared_ptr<StreamLoadContext> ctx,
                                    ctx->load_src_type == TLoadSourceType::KAFKA);
     const int64_t pipeline_wait_start = MonotonicNanos();
     // wait for all consumers finished
-    HANDLE_ERROR(ctx->load_status_future.get(), "consume failed");
+    Status pipeline_status = ctx->load_status_future.get();
     telemetry.timing("task_pipeline_wait", MonotonicNanos() - pipeline_wait_start,
                      ctx->number_loaded_rows);
 
     ctx->load_cost_millis = UnixMillis() - ctx->start_millis;
+
+    if (share_consumer && share_consumer->all_records_completed()) {
+        if (!pipeline_status.ok()) {
+            LOG(INFO) << "Empty fragment for completed Kafka share records: " << ctx->brief()
+                      << ", " << pipeline_status;
+        }
+        // Every acquired record is already durable; retire the unused transaction without a commit.
+        ctx->status = Status::Cancelled("Kafka share batch already completed");
+        if (ctx->need_rollback) {
+            _exec_env->stream_load_executor()->rollback_txn(ctx.get());
+            ctx->need_rollback = false;
+        }
+        ctx->status = Status::OK();
+        const int64_t ack_start = MonotonicNanos();
+        Status st = share_consumer->cancel(ctx);
+        telemetry.timing(st.ok() ? "task_ack_ok" : "task_ack_failed", MonotonicNanos() - ack_start,
+                         0);
+        if (st.ok()) {
+            consumer_pool->return_consumer(std::move(share_consumer));
+        } else {
+            ctx->status = st;
+            LOG(WARNING) << "Completed Kafka share records could not be acknowledged: "
+                         << ctx->brief() << ", " << st;
+            share_consumer.reset();
+        }
+        cb(ctx);
+        return;
+    }
+    HANDLE_ERROR(pipeline_status, "consume failed");
 
     // return the consumer back to pool
     // call this before commit txn, in case the next task can come very fast

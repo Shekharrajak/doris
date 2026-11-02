@@ -20,8 +20,8 @@
 #include <librdkafka/rdkafka.h>
 
 #include <optional>
+#include <span>
 #include <utility>
-#include <vector>
 
 #include "load/routine_load/data_consumer.h"
 #include "load/routine_load/kafka_share_batch.h"
@@ -39,18 +39,24 @@ public:
     Status reset() override;
     bool match(std::shared_ptr<StreamLoadContext> ctx) override;
     Status acknowledge_committed();
+    bool all_records_completed() const { return _batch.all_records_completed(); }
 
 protected:
     virtual Status acknowledge_record(int32_t partition, int64_t offset, bool accept);
     virtual Status commit_acknowledgements();
+    Status consume_messages(std::shared_ptr<StreamLoadContext> ctx,
+                            std::span<rd_kafka_message_t* const> messages, bool filtering,
+                            int64_t poll_ns = 0);
+    virtual Status capture_source_identity(std::span<rd_kafka_message_t* const> messages,
+                                           bool appended_only, std::string* cluster_id);
 
 private:
     using TopicId = std::pair<uint64_t, uint64_t>;
 
-    std::optional<TKafkaSourceDescriptor> build_source_descriptor(
-            int64_t namespace_id, const std::string& cluster_id,
-            const std::vector<TopicId>& topic_ids) const;
-    void capture_source_descriptor(StreamLoadContext* ctx, rd_kafka_messages_t* messages);
+    std::optional<TKafkaSourceDescriptor> build_source_descriptor(int64_t namespace_id,
+                                                                  const std::string& cluster_id,
+                                                                  bool appended_only) const;
+    Status classify_records(std::span<rd_kafka_message_t* const> messages);
     Status acknowledge(bool committed);
 
     rd_kafka_share_t* _consumer = nullptr;

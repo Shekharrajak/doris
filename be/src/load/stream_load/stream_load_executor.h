@@ -21,6 +21,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "common/factory_creator.h"
 
@@ -31,6 +32,7 @@ class StreamLoadContext;
 class Status;
 class TTxnCommitAttachment;
 class TLoadTxnCommitRequest;
+class TKafkaSourceDescriptor;
 
 class StreamLoadExecutor {
     ENABLE_FACTORY_CREATOR(StreamLoadExecutor);
@@ -51,6 +53,10 @@ public:
     void get_commit_request(StreamLoadContext* ctx, TLoadTxnCommitRequest& request);
 
     virtual void rollback_txn(StreamLoadContext* ctx);
+
+    virtual Status get_kafka_source_completions(StreamLoadContext* ctx,
+                                                const TKafkaSourceDescriptor& source,
+                                                std::optional<TKafkaSourceDescriptor>* completed);
 
     Status execute_plan_fragment(std::shared_ptr<StreamLoadContext> ctx,
                                  const TPipelineFragmentParamsList& parent);
