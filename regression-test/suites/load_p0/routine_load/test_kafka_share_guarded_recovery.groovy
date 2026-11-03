@@ -52,7 +52,8 @@ suite("test_kafka_share_guarded_recovery", "kafka_share,docker") {
     options.cloudMode = false
     options.enableDebugPoints()
     options.feConfigs += ["enable_kafka_source_completion_tracking=true", "routine_load_task_min_timeout_sec=180"]
-    options.beConfigs += ["enable_kafka_share_completion_filtering=true"]
+    options.beConfigs += ["enable_kafka_share_completion_filtering=true", "sys_log_level=INFO",
+            "log_buffer_level=-1"]
 
     for (def scenario : [
             [name: "precommit", table: "test_kafka_share_guarded_precommit_recovery",
