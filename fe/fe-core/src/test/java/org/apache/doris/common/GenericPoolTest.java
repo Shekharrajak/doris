@@ -48,6 +48,7 @@ import org.apache.doris.thrift.TScanOpenParams;
 import org.apache.doris.thrift.TScanOpenResult;
 import org.apache.doris.thrift.TSnapshotRequest;
 import org.apache.doris.thrift.TStatus;
+import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStreamLoadRecordResult;
 import org.apache.doris.thrift.TSyncLoadForTabletsRequest;
 import org.apache.doris.thrift.TSyncLoadForTabletsResponse;
@@ -168,6 +169,11 @@ public class GenericPoolTest {
         public TStatus submitRoutineLoadTask(List<TRoutineLoadTask> tasks) throws TException {
             // TODO Auto-generated method stub
             return null;
+        }
+
+        @Override
+        public TStatus submitGuardedRoutineLoadTask(List<TRoutineLoadTask> tasks) throws TException {
+            return new TStatus(TStatusCode.NOT_IMPLEMENTED_ERROR);
         }
 
         @Override

@@ -262,6 +262,9 @@ public class TxnUtil {
         if (rtTaskTxnCommitAttachment.getKafkaSourceDescriptor() != null) {
             builder.setKafkaSourceDescriptor(rtTaskTxnCommitAttachment.getKafkaSourceDescriptor().toPb());
         }
+        if (rtTaskTxnCommitAttachment.getKafkaSourceGuardVersion() != 0) {
+            builder.setKafkaSourceGuardVersion(rtTaskTxnCommitAttachment.getKafkaSourceGuardVersion());
+        }
 
         attachementBuilder.setRlTaskTxnCommitAttachment(builder.build());
         return attachementBuilder.build();

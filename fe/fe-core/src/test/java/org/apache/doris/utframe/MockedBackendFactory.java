@@ -162,6 +162,11 @@ public class MockedBackendFactory {
         }
 
         public abstract void init();
+
+        @Override
+        public TStatus submitGuardedRoutineLoadTask(List<TRoutineLoadTask> tasks) throws TException {
+            return new TStatus(TStatusCode.NOT_IMPLEMENTED_ERROR);
+        }
     }
 
     // the default be thrift service extends from BeThriftService

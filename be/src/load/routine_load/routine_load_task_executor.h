@@ -56,8 +56,10 @@ public:
 
     void stop();
 
+    static Status validate_task(const TRoutineLoadTask& task, int32_t accepted_guard_version = 0);
+
     // submit a routine load task
-    Status submit_task(const TRoutineLoadTask& task);
+    Status submit_task(const TRoutineLoadTask& task, int32_t accepted_guard_version = 0);
 
     Status get_kafka_partition_meta(const PKafkaMetaProxyRequest& request,
                                     std::vector<int32_t>* partition_ids);

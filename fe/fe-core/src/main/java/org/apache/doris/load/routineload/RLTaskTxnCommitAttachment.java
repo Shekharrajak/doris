@@ -53,6 +53,8 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
     private RoutineLoadProgress progress;
     @SerializedName(value = "kafkaSourceDescriptor")
     private KafkaSourceDescriptor kafkaSourceDescriptor;
+    @SerializedName(value = "kafkaSourceGuardVersion")
+    private int kafkaSourceGuardVersion;
     private String errorLogUrl;
     private String firstErrorMsg;
 
@@ -69,6 +71,13 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
         this.unselectedRows = rlTaskTxnCommitAttachment.getUnselectedRows();
         this.receivedBytes = rlTaskTxnCommitAttachment.getReceivedBytes();
         this.taskExecutionTimeMs = rlTaskTxnCommitAttachment.getLoadCostMs();
+        this.kafkaSourceGuardVersion = rlTaskTxnCommitAttachment.isSetKafkaSourceGuardVersion()
+                ? rlTaskTxnCommitAttachment.getKafkaSourceGuardVersion() : 0;
+        if (kafkaSourceGuardVersion > 0) {
+            Preconditions.checkArgument(rlTaskTxnCommitAttachment.getLoadSourceType() == TLoadSourceType.KAFKA
+                            && rlTaskTxnCommitAttachment.isSetKafkaRLTaskProgress(),
+                    "Kafka source guard proof requires a Kafka routine load task with progress");
+        }
         if (rlTaskTxnCommitAttachment.isSetKafkaSourceDescriptor()) {
             Preconditions.checkArgument(rlTaskTxnCommitAttachment.getLoadSourceType() == TLoadSourceType.KAFKA,
                     "Kafka source descriptor requires a Kafka routine load task");
@@ -87,6 +96,7 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
             default:
                 break;
         }
+        validateKafkaSourceGuardVersion();
 
         if (rlTaskTxnCommitAttachment.isSetErrorLogUrl()) {
             this.errorLogUrl = rlTaskTxnCommitAttachment.getErrorLogUrl();
@@ -106,15 +116,19 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
         this.unselectedRows = rlTaskTxnCommitAttachment.getUnselectedRows();
         this.receivedBytes = rlTaskTxnCommitAttachment.getReceivedBytes();
         this.taskExecutionTimeMs = rlTaskTxnCommitAttachment.getTaskExecutionTimeMs();
+        this.kafkaSourceGuardVersion = rlTaskTxnCommitAttachment.getKafkaSourceGuardVersion();
         if (rlTaskTxnCommitAttachment.hasKafkaSourceDescriptor()) {
             this.kafkaSourceDescriptor = KafkaSourceDescriptor.fromPb(
                     rlTaskTxnCommitAttachment.getKafkaSourceDescriptor());
             this.kafkaSourceDescriptor.validateForJob(jobId);
         }
 
+        Preconditions.checkArgument(kafkaSourceGuardVersion <= 0 || rlTaskTxnCommitAttachment.hasProgress(),
+                "Kafka source guard proof requires Kafka routine load progress");
         KafkaProgress progress = new KafkaProgress(rlTaskTxnCommitAttachment.getProgress().getPartitionToOffset());
 
         this.progress = progress;
+        validateKafkaSourceGuardVersion();
         this.errorLogUrl = rlTaskTxnCommitAttachment.getErrorLogUrl();
         this.firstErrorMsg = abbreviateFirstErrorMsg(rlTaskTxnCommitAttachment.getFirstErrorMsg());
     }
@@ -163,9 +177,20 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
         return kafkaSourceDescriptor;
     }
 
+    public int getKafkaSourceGuardVersion() {
+        return kafkaSourceGuardVersion;
+    }
+
+    private void validateKafkaSourceGuardVersion() {
+        Preconditions.checkArgument(kafkaSourceGuardVersion >= 0, "Kafka source guard version must be nonnegative");
+        Preconditions.checkArgument(kafkaSourceGuardVersion == 0 || progress instanceof KafkaProgress,
+                "Kafka source guard proof requires Kafka routine load progress");
+    }
+
     @Override
     public void gsonPostProcess() {
         super.gsonPostProcess();
+        validateKafkaSourceGuardVersion();
         if (kafkaSourceDescriptor != null) {
             Preconditions.checkArgument(progress instanceof KafkaProgress,
                     "Kafka source descriptor requires Kafka routine load progress");

@@ -52,6 +52,8 @@ class StreamLoadPipe;
 // kafka related info
 class KafkaLoadInfo {
 public:
+    static constexpr int32_t SOURCE_GUARD_VERSION = 1;
+
     KafkaLoadInfo(const TKafkaLoadInfo& t_info)
             : brokers(t_info.brokers),
               topic(t_info.topic),
@@ -90,6 +92,7 @@ public:
     //custom kafka property key -> value
     std::map<std::string, std::string> properties;
     bool use_share_consumer = false;
+    int32_t source_guard_version = 0;
     std::optional<TKafkaSourceDescriptor> source_descriptor;
 };
 

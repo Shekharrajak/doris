@@ -704,6 +704,7 @@ struct TRLTaskTxnCommitAttachment {
     12: optional TKinesisRLTaskProgress kinesisRLTaskProgress
     13: optional string firstErrorMsg
     14: optional Types.TKafkaSourceDescriptor kafkaSourceDescriptor
+    15: optional i32 kafka_source_guard_version
 }
 
 struct TTxnCommitAttachment {

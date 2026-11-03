@@ -531,6 +531,9 @@ bool StreamLoadExecutor::collect_load_stat(StreamLoadContext* ctx, TTxnCommitAtt
         if (ctx->kafka_info->source_descriptor) {
             rl_attach.__set_kafkaSourceDescriptor(*ctx->kafka_info->source_descriptor);
         }
+        if (ctx->kafka_info->source_guard_version != 0) {
+            rl_attach.__set_kafka_source_guard_version(ctx->kafka_info->source_guard_version);
+        }
         if (!ctx->error_url.empty()) {
             rl_attach.__set_errorLogUrl(ctx->error_url);
         }
