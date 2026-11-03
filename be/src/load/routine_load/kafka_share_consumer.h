@@ -39,6 +39,7 @@ public:
     Status reset() override;
     bool match(std::shared_ptr<StreamLoadContext> ctx) override;
     Status acknowledge_committed();
+    bool has_acquired_records() const { return !_batch.empty(); }
     bool all_records_completed() const { return _batch.all_records_completed(); }
 
 protected:

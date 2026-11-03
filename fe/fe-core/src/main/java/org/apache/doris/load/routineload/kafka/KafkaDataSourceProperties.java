@@ -51,11 +51,16 @@ public class KafkaDataSourceProperties extends AbstractDataSourceProperties {
     private static final Logger LOG = LogManager.getLogger(KafkaDataSourceProperties.class);
 
     public static final String KAFKA_CONSUMER_TYPE = "kafka_consumer_type";
+    public static final String KAFKA_SHARE_GUARDED_COMMIT = "kafka_share_guarded_commit";
     private static final String LEGACY_KAFKA_CONSUMER_MODE = "kafka_consumer_mode";
 
     @Getter
     @SerializedName(value = "useShareConsumer")
     private boolean useShareConsumer;
+
+    @Getter
+    @SerializedName(value = "shareGuardedCommit")
+    private boolean shareGuardedCommit;
 
     private static final String ENDPOINT_REGEX = "[-A-Za-z0-9+&@#/%?=~_|!:,.;]+[-A-Za-z0-9+&@#/%=~_|]";
 
@@ -104,6 +109,7 @@ public class KafkaDataSourceProperties extends AbstractDataSourceProperties {
             new ImmutableSet.Builder<String>().add(KafkaConfiguration.KAFKA_BROKER_LIST.getName())
                     .add(KafkaConfiguration.KAFKA_TOPIC.getName())
                     .add(KAFKA_CONSUMER_TYPE)
+                    .add(KAFKA_SHARE_GUARDED_COMMIT)
                     .add(LEGACY_KAFKA_CONSUMER_MODE)
                     .add(KafkaConfiguration.KAFKA_PARTITIONS.getName())
                     .add(KafkaConfiguration.KAFKA_OFFSETS.getName())
@@ -185,6 +191,17 @@ public class KafkaDataSourceProperties extends AbstractDataSourceProperties {
             throw new AnalysisException("kafka_consumer_type cannot be altered");
         }
         useShareConsumer = "share".equalsIgnoreCase(consumerType);
+        if (isAlter() && originalDataSourceProperties.containsKey(KAFKA_SHARE_GUARDED_COMMIT)) {
+            throw new AnalysisException(KAFKA_SHARE_GUARDED_COMMIT + " cannot be altered");
+        }
+        String guardedCommit = originalDataSourceProperties.getOrDefault(KAFKA_SHARE_GUARDED_COMMIT, "false");
+        if (!"true".equalsIgnoreCase(guardedCommit) && !"false".equalsIgnoreCase(guardedCommit)) {
+            throw new AnalysisException(KAFKA_SHARE_GUARDED_COMMIT + " must be true or false");
+        }
+        shareGuardedCommit = Boolean.parseBoolean(guardedCommit);
+        if (shareGuardedCommit && !useShareConsumer) {
+            throw new AnalysisException(KAFKA_SHARE_GUARDED_COMMIT + " requires share consumption");
+        }
         if (useShareConsumer) {
             validateShareConsumerProperties();
             return;

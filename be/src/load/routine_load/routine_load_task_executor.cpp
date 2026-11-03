@@ -405,7 +405,7 @@ Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task,
     // the routine load task'txn has already began in FE.
     // so it need to rollback if encounter error.
     ctx->need_rollback = true;
-    ctx->max_filter_ratio = 1.0;
+    ctx->max_filter_ratio = accepted_guard_version != 0 ? 0.0 : 1.0;
 
     // set source related params
     switch (task.type) {
@@ -622,13 +622,15 @@ void RoutineLoadTaskExecutor::exec_task(std::shared_ptr<StreamLoadContext> ctx,
 
     ctx->load_cost_millis = UnixMillis() - ctx->start_millis;
 
-    if (share_consumer && share_consumer->all_records_completed()) {
+    const bool guarded = ctx->kafka_info && ctx->kafka_info->source_guard_version != 0;
+    if (share_consumer && (share_consumer->all_records_completed() ||
+                           (guarded && !share_consumer->has_acquired_records()))) {
         if (!pipeline_status.ok()) {
-            LOG(INFO) << "Empty fragment for completed Kafka share records: " << ctx->brief()
-                      << ", " << pipeline_status;
+            LOG(INFO) << "Unused fragment for Kafka share records: " << ctx->brief() << ", "
+                      << pipeline_status;
         }
-        // Every acquired record is already durable; retire the unused transaction without a commit.
-        ctx->status = Status::Cancelled("Kafka share batch already completed");
+        // An empty or already completed batch has no new effects to commit.
+        ctx->status = Status::Cancelled("Kafka share batch has no new effects");
         if (ctx->need_rollback) {
             _exec_env->stream_load_executor()->rollback_txn(ctx.get());
             ctx->need_rollback = false;
@@ -650,6 +652,14 @@ void RoutineLoadTaskExecutor::exec_task(std::shared_ptr<StreamLoadContext> ctx,
         return;
     }
     HANDLE_ERROR(pipeline_status, "consume failed");
+    if (guarded && (ctx->number_filtered_rows != 0 || ctx->number_unselected_rows != 0 ||
+                    (ctx->kafka_info->source_descriptor && ctx->number_loaded_rows <= 0))) {
+        HANDLE_ERROR(Status::DataQualityError("PAUSE: Guarded Kafka share load rejected rows: "
+                                              "loaded={}, filtered={}, unselected={}",
+                                              ctx->number_loaded_rows, ctx->number_filtered_rows,
+                                              ctx->number_unselected_rows),
+                     "guarded load quality check failed");
+    }
 
     // return the consumer back to pool
     // call this before commit txn, in case the next task can come very fast
@@ -736,6 +746,9 @@ void RoutineLoadTaskExecutor::err_handler(std::shared_ptr<StreamLoadContext> ctx
     LOG(WARNING) << err_msg << ", routine load task: " << ctx->brief(true);
     ctx->status = st;
     if (ctx->need_rollback) {
+        if (ctx->kafka_info && ctx->kafka_info->source_guard_version != 0) {
+            ctx->status = Status::InternalError("PAUSE: Guarded Kafka share task failed: {}", st);
+        }
         _exec_env->stream_load_executor()->rollback_txn(ctx.get());
         ctx->need_rollback = false;
     }

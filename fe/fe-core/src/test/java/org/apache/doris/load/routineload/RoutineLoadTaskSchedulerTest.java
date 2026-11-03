@@ -20,21 +20,32 @@ package org.apache.doris.load.routineload;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ClientPool;
+import org.apache.doris.common.Config;
+import org.apache.doris.common.GenericPool;
 import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.LoadException;
 import org.apache.doris.common.MetaNotFoundException;
+import org.apache.doris.common.UserException;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.load.RoutineLoadDesc;
 import org.apache.doris.load.routineload.kafka.KafkaProgress;
 import org.apache.doris.load.routineload.kafka.KafkaRoutineLoadJob;
 import org.apache.doris.load.routineload.kafka.KafkaTaskInfo;
+import org.apache.doris.persist.EditLog;
+import org.apache.doris.system.Backend;
+import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.task.AgentTaskExecutor;
 import org.apache.doris.thrift.BackendService;
+import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TRoutineLoadTask;
+import org.apache.doris.thrift.TStatus;
+import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.transaction.BeginTransactionException;
 import org.apache.doris.transaction.GlobalTransactionMgr;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import org.apache.thrift.TApplicationException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -189,6 +200,96 @@ public class RoutineLoadTaskSchedulerTest {
         LinkedBlockingDeque<RoutineLoadTaskInfo> needScheduleTasksQueue =
                 Deencapsulation.getField(routineLoadTaskScheduler, "needScheduleTasksQueue");
         Assertions.assertTrue(needScheduleTasksQueue.isEmpty());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testGuardedDispatchDoesNotFallBackToOrdinaryRpc() throws Exception {
+        GenericPool<BackendService.Client> previous = ClientPool.backendPool;
+        GenericPool<BackendService.Client> pool = Mockito.mock(GenericPool.class);
+        BackendService.Client client = Mockito.mock(BackendService.Client.class);
+        SystemInfoService systemInfo = Mockito.mock(SystemInfoService.class);
+        envStatic.when(Env::getCurrentSystemInfo).thenReturn(systemInfo);
+        Mockito.when(systemInfo.getBackend(100L)).thenReturn(new Backend(100L, "localhost", 9050));
+        Mockito.when(pool.borrowObject(Mockito.any(TNetworkAddress.class))).thenReturn(client);
+        Mockito.when(client.submitRoutineLoadTask(Mockito.anyList())).thenReturn(new TStatus(TStatusCode.OK));
+        Mockito.when(client.submitGuardedRoutineLoadTask(Mockito.anyList())).thenReturn(new TStatus(TStatusCode.OK));
+        ClientPool.backendPool = pool;
+        try {
+            RoutineLoadTaskScheduler scheduler = new RoutineLoadTaskScheduler(routineLoadManager);
+            TRoutineLoadTask task = new TRoutineLoadTask();
+            Deencapsulation.invoke(scheduler, "submitTask", 100L, task);
+            task.setKafkaSourceGuardVersion(1);
+            task.unsetKafkaSourceGuardVersion();
+            Deencapsulation.invoke(scheduler, "submitTask", 100L, task);
+            task.setKafkaSourceGuardVersion(1);
+            Deencapsulation.invoke(scheduler, "submitTask", 100L, task);
+            Mockito.when(client.submitGuardedRoutineLoadTask(Mockito.anyList())).thenThrow(
+                    new TApplicationException(TApplicationException.UNKNOWN_METHOD, "unsupported guarded submit"));
+            Assertions.assertThrows(LoadException.class,
+                    () -> Deencapsulation.invoke(scheduler, "submitTask", 100L, task));
+            Mockito.verify(client, Mockito.times(2)).submitRoutineLoadTask(Mockito.anyList());
+            Mockito.verify(client, Mockito.times(2)).submitGuardedRoutineLoadTask(Mockito.anyList());
+        } finally {
+            ClientPool.backendPool = previous;
+        }
+    }
+
+    @Test
+    public void testGuardedSubmitFailurePausesWithoutRenewal() {
+        Mockito.when(env.getEditLog()).thenReturn(Mockito.mock(EditLog.class));
+        for (String error : new String[] {"network error", "TOO_MANY_TASKS", "MEM_LIMIT_EXCEEDED"}) {
+            LockCheckingKafkaRoutineLoadJob job = new LockCheckingKafkaRoutineLoadJob();
+            Deencapsulation.setField(job, "kafkaSourceGuardVersion", 1);
+            Deencapsulation.setField(job, "state", RoutineLoadJob.JobState.RUNNING);
+            KafkaTaskInfo task = new KafkaTaskInfo(new UUID(1, 1), 1L, 20000,
+                    Maps.newHashMap(), false, -1, false);
+            task.setBeId(100L);
+            Deencapsulation.setField(job, "routineLoadTaskInfoList", Lists.newArrayList(task));
+            Mockito.when(routineLoadManager.getJob(1L)).thenReturn(job);
+            RoutineLoadTaskScheduler scheduler = new RoutineLoadTaskScheduler(routineLoadManager);
+            Deencapsulation.invoke(scheduler, "handleSubmitTaskFailure", task, error);
+            Assertions.assertEquals(RoutineLoadJob.JobState.PAUSED, job.getState());
+            Assertions.assertFalse(job.isRenewCalled());
+            Assertions.assertEquals(-1L, task.getBeId());
+            LinkedBlockingDeque<RoutineLoadTaskInfo> queue =
+                    Deencapsulation.getField(scheduler, "needScheduleTasksQueue");
+            Assertions.assertTrue(queue.isEmpty());
+        }
+    }
+
+    @Test
+    public void testGuardedSchedulingPausesBeforeBeginWhenTrackingOrDeploymentIsUnsupported() throws Exception {
+        boolean previous = Config.enable_kafka_source_completion_tracking;
+        String previousMode = Config.deploy_mode;
+        String previousCloud = Config.cloud_unique_id;
+        Mockito.when(env.getEditLog()).thenReturn(Mockito.mock(EditLog.class));
+        Mockito.when(routineLoadManager.checkTaskInJob(Mockito.any())).thenReturn(true);
+        try {
+            for (boolean cloud : new boolean[] {false, true}) {
+                Config.enable_kafka_source_completion_tracking = cloud;
+                Config.deploy_mode = cloud ? "cloud" : "local";
+                Config.cloud_unique_id = "";
+                LockCheckingKafkaRoutineLoadJob job = new LockCheckingKafkaRoutineLoadJob();
+                Deencapsulation.setField(job, "kafkaSourceGuardVersion", 1);
+                Deencapsulation.setField(job, "state", RoutineLoadJob.JobState.RUNNING);
+                Mockito.when(routineLoadManager.getJob(1L)).thenReturn(job);
+                KafkaTaskInfo task = new KafkaTaskInfo(new UUID(1, 1), 1L, 20000,
+                        Maps.newHashMap(), false, -1, false);
+                Deencapsulation.setField(job, "routineLoadTaskInfoList", Lists.newArrayList(task));
+                RoutineLoadTaskScheduler scheduler = new RoutineLoadTaskScheduler(routineLoadManager);
+                Assertions.assertThrows(UserException.class,
+                        () -> Deencapsulation.invoke(scheduler, "scheduleOneTask", task));
+                Assertions.assertEquals(RoutineLoadJob.JobState.PAUSED, job.getState());
+                Assertions.assertEquals(RoutineLoadTaskInfo.INIT_TXN_ID, task.getTxnId());
+                Mockito.verify(routineLoadManager, Mockito.never()).getAvailableBeForTask(Mockito.anyLong(),
+                        Mockito.anyLong());
+            }
+        } finally {
+            Config.enable_kafka_source_completion_tracking = previous;
+            Config.deploy_mode = previousMode;
+            Config.cloud_unique_id = previousCloud;
+        }
     }
 
     private static class LockCheckingKafkaRoutineLoadJob extends KafkaRoutineLoadJob {

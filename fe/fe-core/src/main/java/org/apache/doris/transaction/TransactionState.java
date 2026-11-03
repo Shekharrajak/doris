@@ -282,6 +282,8 @@ public class TransactionState implements Writable {
     private volatile TxnCommitAttachment txnCommitAttachment;
     @SerializedName(value = "kafkaSourceCompletionTracked")
     private volatile boolean kafkaSourceCompletionTracked;
+    @SerializedName(value = "kafkaSourceGuardVersionRequired")
+    private volatile int kafkaSourceGuardVersionRequired;
     private transient volatile CompletableFuture<Void> kafkaSourceCommitDurability;
 
     // this map should be set when load execution begin, so that when the txn commit, it will know
@@ -696,6 +698,53 @@ public class TransactionState implements Writable {
         return kafkaSourceDescriptor(txnCommitAttachment) != null;
     }
 
+    public int getKafkaSourceGuardVersionRequired() {
+        return kafkaSourceGuardVersionRequired;
+    }
+
+    synchronized void requireKafkaSourceGuardVersion(int version) {
+        Preconditions.checkState(transactionStatus == TransactionStatus.PREPARE,
+                "Kafka source guard policy must be initialized before commit");
+        Preconditions.checkArgument(version == 0 || version == 1, "Unsupported Kafka source guard policy");
+        Preconditions.checkState(kafkaSourceGuardVersionRequired == 0 || kafkaSourceGuardVersionRequired == version,
+                "Kafka source guard policy cannot be changed");
+        Preconditions.checkState(version == 0 || (sourceType == LoadJobSourceType.ROUTINE_LOAD_TASK
+                        && callbackId > 0 && tableIdList.size() == 1 && subTxnIds == null),
+                "Kafka source guard policy requires a single-table routine load transaction");
+        Preconditions.checkState(version == kafkaSourceGuardVersionRequired || txnCommitAttachment == null,
+                "Kafka source guard policy must precede the load attachment");
+        kafkaSourceGuardVersionRequired = version;
+    }
+
+    private boolean matchesKafkaSourceGuardProof(TxnCommitAttachment attachment) {
+        if (!(attachment instanceof RLTaskTxnCommitAttachment)) {
+            return false;
+        }
+        RLTaskTxnCommitAttachment routine = (RLTaskTxnCommitAttachment) attachment;
+        KafkaSourceDescriptor descriptor = routine.getKafkaSourceDescriptor();
+        return routine.getKafkaSourceGuardVersion() == kafkaSourceGuardVersionRequired
+                && routine.getJobId() == callbackId && descriptor != null
+                && descriptor.getNamespaceId() == callbackId && routine.getLoadedRows() > 0
+                && routine.getFilteredRows() == 0 && routine.getUnselectedRows() == 0;
+    }
+
+    private void validateKafkaSourceGuardCommit(TxnCommitAttachment attachment)
+            throws TransactionCommitFailedException {
+        if (kafkaSourceGuardVersionRequired == 0) {
+            return;
+        }
+        if (kafkaSourceGuardVersionRequired != 1 || sourceType != LoadJobSourceType.ROUTINE_LOAD_TASK
+                || callbackId <= 0 || tableIdList.size() != 1 || subTxnIds != null
+                || !Config.enable_kafka_source_completion_tracking || Config.isCloudMode()
+                || !matchesKafkaSourceGuardProof(attachment)
+                || (hasKafkaSourceDescriptor() && !matchesKafkaSourceGuardProof(txnCommitAttachment))
+                || ((transactionStatus == TransactionStatus.COMMITTED || transactionStatus == TransactionStatus.VISIBLE)
+                        && !kafkaSourceCompletionTracked)) {
+            throw new TransactionCommitFailedException("PAUSE: Guarded Kafka source proof or tracking is invalid for "
+                    + "transaction " + transactionId);
+        }
+    }
+
     KafkaSourceDescriptor getKafkaSourceDescriptor() {
         return kafkaSourceDescriptor(txnCommitAttachment);
     }
@@ -714,6 +763,7 @@ public class TransactionState implements Writable {
 
     synchronized void bindKafkaSourceCommitAttachment(TxnCommitAttachment attachment)
             throws TransactionCommitFailedException {
+        validateKafkaSourceGuardCommit(attachment);
         KafkaSourceDescriptor bound = kafkaSourceDescriptor(txnCommitAttachment);
         KafkaSourceDescriptor incoming = kafkaSourceDescriptor(attachment);
         if (bound == null && incoming == null) {
@@ -796,6 +846,18 @@ public class TransactionState implements Writable {
     }
 
     synchronized void validateReplayedKafkaSourceCommitDurability() {
+        Preconditions.checkState(kafkaSourceGuardVersionRequired == 0 || kafkaSourceGuardVersionRequired == 1,
+                "Unsupported persisted Kafka source guard policy");
+        if (kafkaSourceGuardVersionRequired != 0) {
+            Preconditions.checkState(sourceType == LoadJobSourceType.ROUTINE_LOAD_TASK
+                            && callbackId > 0 && tableIdList.size() == 1 && subTxnIds == null,
+                    "Guarded Kafka source transaction has an invalid owner");
+            if (transactionStatus == TransactionStatus.COMMITTED || transactionStatus == TransactionStatus.VISIBLE) {
+                Preconditions.checkState(kafkaSourceCompletionTracked
+                                && matchesKafkaSourceGuardProof(txnCommitAttachment),
+                        "Guarded Kafka source commit is missing tracked completion proof");
+            }
+        }
         if (hasKafkaSourceDescriptor() && (transactionStatus == TransactionStatus.COMMITTED
                 || transactionStatus == TransactionStatus.VISIBLE)) {
             Preconditions.checkState(kafkaSourceCommitDurability == null

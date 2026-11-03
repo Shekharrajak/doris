@@ -135,8 +135,13 @@ public class RoutineLoadTaskScheduler extends MasterDaemon {
         }
 
         try {
-            if (routineLoadManager.getJob(routineLoadTaskInfo.getJobId()).isFinal()) {
+            RoutineLoadJob currentJob = routineLoadManager.getJob(routineLoadTaskInfo.getJobId());
+            if (currentJob.isFinal()) {
                 return;
+            }
+            if (currentJob.getKafkaSourceGuardVersion() > 0
+                    && (!Config.enable_kafka_source_completion_tracking || Config.isCloudMode())) {
+                throw new UserException("Guarded Kafka share commits require non-cloud source completion tracking");
             }
             // check if topic has more data to consume
             if (!routineLoadTaskInfo.hasMoreDataToConsume()) {
@@ -244,7 +249,8 @@ public class RoutineLoadTaskScheduler extends MasterDaemon {
         routineLoadTaskInfo.setExecuteStartTimeMs(System.currentTimeMillis());
     }
 
-    private void handleSubmitTaskFailure(RoutineLoadTaskInfo routineLoadTaskInfo, String errorMsg) {
+    private void handleSubmitTaskFailure(RoutineLoadTaskInfo routineLoadTaskInfo, String errorMsg)
+            throws UserException {
         LOG.warn("failed to submit routine load task {} to BE: {}, error: {}",
                 DebugUtil.printId(routineLoadTaskInfo.getId()),
                 routineLoadTaskInfo.getBeId(), errorMsg);
@@ -255,6 +261,15 @@ public class RoutineLoadTaskScheduler extends MasterDaemon {
         routineLoadJob.writeLock();
         try {
             routineLoadJob.setOtherMsg(errorMsg);
+
+            if (routineLoadJob.getKafkaSourceGuardVersion() > 0) {
+                if (routineLoadJob.getState() == JobState.RUNNING
+                        && routineLoadJob.containsTask(routineLoadTaskInfo.getId())) {
+                    routineLoadJob.updateState(JobState.PAUSED, new ErrorReason(InternalErrorCode.CREATE_TASKS_ERR,
+                            "Guarded Kafka share task submission failed: " + errorMsg), false);
+                }
+                return;
+            }
 
             // Check if this is a resource pressure error that should not be immediately rescheduled
             if (errorMsg.contains("TOO_MANY_TASKS") || errorMsg.contains("MEM_LIMIT_EXCEEDED")) {
@@ -320,7 +335,9 @@ public class RoutineLoadTaskScheduler extends MasterDaemon {
         BackendService.Client client = null;
         try {
             client = ClientPool.backendPool.borrowObject(address);
-            TStatus tStatus = client.submitRoutineLoadTask(Lists.newArrayList(tTask));
+            TStatus tStatus = tTask.isSetKafkaSourceGuardVersion() && tTask.getKafkaSourceGuardVersion() > 0
+                    ? client.submitGuardedRoutineLoadTask(Lists.newArrayList(tTask))
+                    : client.submitRoutineLoadTask(Lists.newArrayList(tTask));
             ok = true;
 
             if (DebugPointUtil.isEnable("FE.ROUTINE_LOAD_TASK_SUBMIT_FAILED")) {

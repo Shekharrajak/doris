@@ -612,6 +612,10 @@ public abstract class RoutineLoadJob
         return whereExpr;
     }
 
+    public int getKafkaSourceGuardVersion() {
+        return 0;
+    }
+
     public Separator getColumnSeparator() {
         return columnSeparator;
     }
@@ -1324,8 +1328,10 @@ public abstract class RoutineLoadJob
                 ++this.jobStatistic.currentAbortedTaskNum;
                 TransactionState.TxnStatusChangeReason txnStatusChangeReason = null;
                 if (txnStatusChangeReasonString != null) {
-                    txnStatusChangeReason =
-                            TransactionState.TxnStatusChangeReason.fromString(txnStatusChangeReasonString);
+                    txnStatusChangeReason = getKafkaSourceGuardVersion() > 0
+                            && txnStatusChangeReasonString.contains("PAUSE:")
+                            ? TransactionState.TxnStatusChangeReason.PAUSE
+                            : TransactionState.TxnStatusChangeReason.fromString(txnStatusChangeReasonString);
                     String msg;
                     if (txnStatusChangeReason != null) {
                         switch (txnStatusChangeReason) {
@@ -2047,6 +2053,7 @@ public abstract class RoutineLoadJob
                     }
                 }
                 createRoutineLoadInfo.validate(ctx);
+                validateReplayedCreateInfo(createRoutineLoadInfo);
                 setRoutineLoadDesc(createRoutineLoadInfo.getRoutineLoadDesc());
             } finally {
                 ctx.cleanup();
@@ -2073,6 +2080,9 @@ public abstract class RoutineLoadJob
     }
 
     public abstract void modifyProperties(AlterRoutineLoadCommand command) throws UserException;
+
+    protected void validateReplayedCreateInfo(CreateRoutineLoadInfo info) throws UserException {
+    }
 
     public abstract void replayModifyProperties(AlterRoutineLoadJobOperationLog log);
 

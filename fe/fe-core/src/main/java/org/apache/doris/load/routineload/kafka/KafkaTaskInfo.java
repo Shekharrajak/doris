@@ -93,6 +93,9 @@ public class KafkaTaskInfo extends RoutineLoadTaskInfo {
         tRoutineLoadTask.setId(queryId);
         tRoutineLoadTask.setJobId(jobId);
         tRoutineLoadTask.setTxnId(txnId);
+        if (routineLoadJob.getKafkaSourceGuardVersion() > 0) {
+            tRoutineLoadTask.setKafkaSourceGuardVersion(routineLoadJob.getKafkaSourceGuardVersion());
+        }
         Database database =
                 Env.getCurrentInternalCatalog().getDbOrMetaException(routineLoadJob.getDbId());
 
