@@ -138,3 +138,30 @@ duplicates while the checks require every input ID and its payload to arrive.
 The suite skips explicitly unless Kafka tests and `kafkaTrunkHome` are configured.
 It uses ordinary share acknowledgements and requires no transactional
 acknowledgement extension.
+
+### Guarded recovery regression
+
+Set `enableKafkaShareGuardedTest = "true"` alongside the Kafka settings above.
+Use a Docker image built from this branch with `ENABLE_INJECTION_POINT=ON` and
+matching librdkafka headers and runtime exposing the delivered-message topic UUID API.
+The Kafka advertised addresses must be reachable from both the regression host
+and the containers.
+
+```bash
+./run-regression-test.sh --run -d load_p0/routine_load \
+    -s test_kafka_share_guarded_recovery -image <guarded-doris-image>
+```
+
+Each fault uses a fresh non-cloud cluster with tracking, filtering and debug
+points. The suite stops blocked BEs before the commit RPC, then after commit
+but before acknowledgement, and restarts the FE to exercise completion replay.
+It requires observed redelivery and exact IDs, payloads and multiplicities in a
+Duplicate Key table; missing rows, extra rows and duplicates fail the test.
+Faults are mandatory when opted in. This covers two restart windows, not a full
+network-partition, journal-loss or performance campaign.
+
+Run the API-enabled native tests separately before merging:
+
+```bash
+./run-be-ut.sh -j 1 --run --filter='KafkaShareConsumerTest.*:KafkaShareFilteringTest.*:RoutineLoadTaskExecutorTest.*:BackendGuardedRoutineLoadSubmitTest.*'
+```
