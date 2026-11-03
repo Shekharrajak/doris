@@ -86,6 +86,9 @@ public:
     void submit_routine_load_task(TStatus& t_status,
                                   const std::vector<TRoutineLoadTask>& tasks) override;
 
+    void submit_guarded_routine_load_task(TStatus& t_status,
+                                          const std::vector<TRoutineLoadTask>& tasks) override;
+
     // used for external service, open means start the scan procedure
     void open_scanner(TScanOpenResult& result_, const TScanOpenParams& params) override;
 

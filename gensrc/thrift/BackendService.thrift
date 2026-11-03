@@ -87,6 +87,7 @@ struct TRoutineLoadTask {
     18: optional string qualified_user
     19: optional string cloud_cluster
     20: optional TKinesisLoadInfo kinesis_load_info
+    21: optional i32 kafka_source_guard_version
 }
 
 struct TKafkaMetaProxyRequest {
@@ -425,6 +426,8 @@ service BackendService {
     list<TDiskTrashInfo> get_disk_trash_used_capacity();
 
     Status.TStatus submit_routine_load_task(1:list<TRoutineLoadTask> tasks);
+    // Do not fall back to ordinary submit when this method is unavailable.
+    Status.TStatus submit_guarded_routine_load_task(1:list<TRoutineLoadTask> tasks);
 
     // doris will build  a scan context for this session, context_id returned if success
     DorisExternalService.TScanOpenResult open_scanner(1: DorisExternalService.TScanOpenParams params);

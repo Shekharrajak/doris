@@ -34,7 +34,9 @@
 #include <utility>
 #include <vector>
 
+#include "cloud/config.h"
 #include "common/config.h"
+#include "common/env_config.h"
 #include "common/status.h"
 #include "gtest/gtest_pred_impl.h"
 #include "io/fs/stream_load_pipe.h"
@@ -43,6 +45,7 @@
 #include "load/stream_load/stream_load_executor.h"
 #include "runtime/cluster_info.h"
 #include "runtime/exec_env.h"
+#include "util/defer_op.h"
 
 namespace doris {
 
@@ -240,6 +243,21 @@ public:
         source.__set_clusterId("source-cluster");
         source.__set_partitions({partition});
         return source;
+    }
+
+    TRoutineLoadTask guarded_task() {
+        TRoutineLoadTask task;
+        task.__set_type(TLoadSourceType::KAFKA);
+        task.__set_id(UniqueId::gen_uid().to_thrift());
+        task.__set_job_id(1);
+        task.__set_txn_id(4);
+        task.__set_kafka_source_guard_version(KafkaLoadInfo::SOURCE_GUARD_VERSION);
+        TKafkaLoadInfo info;
+        info.__set_brokers("localhost:9092");
+        info.__set_topic("events");
+        info.__set_use_share_consumer(true);
+        task.__set_kafka_load_info(info);
+        return task;
     }
 
     void SetUp() override {
@@ -469,6 +487,96 @@ TEST_F(RoutineLoadTaskExecutorTest, CompletionLookupPreservesEmptyAndPresentSucc
     completed = source;
     EXPECT_FALSE(executor->get_kafka_source_completions(ctx.get(), source, &completed).ok());
     EXPECT_FALSE(completed.has_value());
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, GuardVersionRequiresAnExplicitSupportedSubmitRoute) {
+    auto task = guarded_task();
+    EXPECT_TRUE(RoutineLoadTaskExecutor::validate_task(task).is<ErrorCode::INVALID_ARGUMENT>());
+    task.__isset.kafka_source_guard_version = false;
+    EXPECT_TRUE(RoutineLoadTaskExecutor::validate_task(task).ok());
+    EXPECT_TRUE(RoutineLoadTaskExecutor::validate_task(task, 1).is<ErrorCode::INVALID_ARGUMENT>());
+    task.__set_kafka_source_guard_version(2);
+    EXPECT_TRUE(RoutineLoadTaskExecutor::validate_task(task, 1).is<ErrorCode::INVALID_ARGUMENT>());
+    task.__set_kafka_source_guard_version(-1);
+    EXPECT_TRUE(RoutineLoadTaskExecutor::validate_task(task).is<ErrorCode::INVALID_ARGUMENT>());
+
+    const bool previous = config::enable_kafka_share_completion_filtering;
+    Defer restore {[&] { config::enable_kafka_share_completion_filtering = previous; }};
+    config::enable_kafka_share_completion_filtering = false;
+    task.__set_kafka_source_guard_version(1);
+#ifdef HAVE_RDKAFKA_MESSAGE_TOPIC_ID
+    EXPECT_TRUE(RoutineLoadTaskExecutor::validate_task(task, 1).is<ErrorCode::INVALID_ARGUMENT>());
+#else
+    EXPECT_TRUE(
+            RoutineLoadTaskExecutor::validate_task(task, 1).is<ErrorCode::NOT_IMPLEMENTED_ERROR>());
+#endif
+}
+
+#ifdef HAVE_RDKAFKA_MESSAGE_TOPIC_ID
+TEST_F(RoutineLoadTaskExecutorTest,
+       GuardedResubmissionValidatesModeAndOwnerBeforeDuplicateShortcut) {
+    const bool previous = config::enable_kafka_share_completion_filtering;
+    const std::string previous_mode = config::deploy_mode;
+    const std::string previous_cloud = config::cloud_unique_id;
+    Defer restore {[&] {
+        config::enable_kafka_share_completion_filtering = previous;
+        config::deploy_mode = previous_mode;
+        config::cloud_unique_id = previous_cloud;
+    }};
+    config::enable_kafka_share_completion_filtering = true;
+    config::deploy_mode = "local";
+    config::cloud_unique_id.clear();
+    auto task = guarded_task();
+    auto ctx = completion_context();
+    ctx->id = UniqueId(task.id);
+    RoutineLoadTaskExecutor executor(_env);
+    Defer stop {[&] { executor.stop(); }};
+    executor._task_map[ctx->id] = ctx;
+    EXPECT_TRUE(executor.submit_task(task, 1).is<ErrorCode::INVALID_ARGUMENT>());
+    ctx->kafka_info->source_guard_version = 1;
+    EXPECT_TRUE(executor.submit_task(task, 1).ok());
+    task.__set_txn_id(5);
+    EXPECT_TRUE(executor.submit_task(task, 1).is<ErrorCode::INVALID_ARGUMENT>());
+    task.__set_txn_id(4);
+    task.__set_job_id(2);
+    EXPECT_TRUE(executor.submit_task(task, 1).is<ErrorCode::INVALID_ARGUMENT>());
+    task.__set_job_id(1);
+    task.__isset.kafka_source_guard_version = false;
+    EXPECT_TRUE(executor.submit_task(task).is<ErrorCode::INVALID_ARGUMENT>());
+    task.__set_kafka_source_guard_version(1);
+    config::enable_kafka_share_completion_filtering = false;
+    EXPECT_TRUE(executor.submit_task(task, 1).is<ErrorCode::INVALID_ARGUMENT>());
+    EXPECT_EQ(executor._task_map.size(), 1);
+    EXPECT_EQ(executor._task_map.at(ctx->id), ctx);
+}
+#endif
+
+TEST_F(RoutineLoadTaskExecutorTest, GuardProofComesFromTaskContextAndSurvivesProofOnlyRollback) {
+    const bool previous = config::enable_kafka_share_completion_filtering;
+    Defer restore {[&] { config::enable_kafka_share_completion_filtering = previous; }};
+    config::enable_kafka_share_completion_filtering = true;
+    auto ctx = completion_context();
+    auto* executor = _env->stream_load_executor();
+    TLoadTxnCommitRequest legacy;
+    executor->get_commit_request(ctx.get(), legacy);
+    EXPECT_FALSE(legacy.txnCommitAttachment.rlTaskTxnCommitAttachment.__isset
+                         .kafka_source_guard_version);
+
+    ctx->kafka_info->source_guard_version = 1;
+    ctx->kafka_info->source_descriptor = source_descriptor();
+    TLoadTxnCommitRequest guarded;
+    executor->get_commit_request(ctx.get(), guarded);
+    const auto& attachment = guarded.txnCommitAttachment.rlTaskTxnCommitAttachment;
+    ASSERT_TRUE(attachment.__isset.kafka_source_guard_version);
+    EXPECT_EQ(attachment.kafka_source_guard_version, 1);
+    EXPECT_EQ(attachment.kafkaSourceDescriptor, *ctx->kafka_info->source_descriptor);
+
+    ctx->kafka_info->source_descriptor.reset();
+    TTxnCommitAttachment rollback;
+    ASSERT_TRUE(executor->collect_load_stat(ctx.get(), &rollback));
+    EXPECT_TRUE(rollback.rlTaskTxnCommitAttachment.__isset.kafka_source_guard_version);
+    EXPECT_EQ(rollback.rlTaskTxnCommitAttachment.kafka_source_guard_version, 1);
+    EXPECT_FALSE(rollback.rlTaskTxnCommitAttachment.__isset.kafkaSourceDescriptor);
 }
 
 TEST_F(RoutineLoadTaskExecutorTest, exec_task) {

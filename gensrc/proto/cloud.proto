@@ -458,6 +458,7 @@ message RLTaskTxnCommitAttachmentPB {
     optional string error_log_url = 9;
     optional string first_error_msg = 10;
     optional KafkaSourceDescriptorPB kafka_source_descriptor = 11;
+    optional int32 kafka_source_guard_version = 12;
 }
 
 message RoutineLoadJobStatisticPB {

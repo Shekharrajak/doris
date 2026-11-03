@@ -45,6 +45,8 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -174,6 +176,111 @@ public class KafkaSourceDescriptorTest {
         Assertions.assertEquals(attachment.getKafkaSourceDescriptor(), restored.getKafkaSourceDescriptor());
         Assertions.assertEquals(attachment.getKafkaSourceDescriptor().hashCode(),
                 restored.getKafkaSourceDescriptor().hashCode());
+    }
+
+    @Test
+    public void testAbsentGuardProofRemainsLegacyAcrossMetadataFormats() {
+        TRLTaskTxnCommitAttachment thrift = thriftAttachment();
+        Assertions.assertFalse(thrift.isSetKafkaSourceGuardVersion());
+        RLTaskTxnCommitAttachment attachment = new RLTaskTxnCommitAttachment(thrift);
+        Assertions.assertEquals(0, attachment.getKafkaSourceGuardVersion());
+        TRLTaskTxnCommitAttachment unset = thriftAttachment().setKafkaSourceGuardVersion(1);
+        unset.unsetKafkaSourceGuardVersion();
+        Assertions.assertEquals(0, new RLTaskTxnCommitAttachment(unset).getKafkaSourceGuardVersion());
+        KafkaSourceDescriptor descriptor = attachment.getKafkaSourceDescriptor();
+        Assertions.assertEquals(KafkaSourceDescriptor.fromThrift(thriftDescriptor()), descriptor);
+
+        TxnCommitAttachmentPB proto = TxnUtil.rlTaskTxnCommitAttachmentToPb(attachment);
+        Assertions.assertFalse(proto.getRlTaskTxnCommitAttachment().hasKafkaSourceGuardVersion());
+        Assertions.assertTrue(proto.getRlTaskTxnCommitAttachment().hasKafkaSourceDescriptor());
+        RLTaskTxnCommitAttachment restored = TxnUtil.rtTaskTxnCommitAttachmentFromPb(proto);
+        Assertions.assertEquals(0, restored.getKafkaSourceGuardVersion());
+        Assertions.assertEquals(descriptor, restored.getKafkaSourceDescriptor());
+        JsonObject legacy = JsonParser.parseString(GsonUtils.GSON.toJson(attachment)).getAsJsonObject();
+        legacy.remove("kafkaSourceGuardVersion");
+        RLTaskTxnCommitAttachment oldMetadata = GsonUtils.GSON.fromJson(legacy, RLTaskTxnCommitAttachment.class);
+        Assertions.assertEquals(0, oldMetadata.getKafkaSourceGuardVersion());
+        Assertions.assertEquals(descriptor, oldMetadata.getKafkaSourceDescriptor());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2})
+    public void testGuardProofVersionRoundTripsWithoutChangingSourceIdentity(int version) {
+        RLTaskTxnCommitAttachment attachment = new RLTaskTxnCommitAttachment(
+                thriftAttachment().setKafkaSourceGuardVersion(version));
+        KafkaSourceDescriptor descriptor = attachment.getKafkaSourceDescriptor();
+        Assertions.assertEquals(version, attachment.getKafkaSourceGuardVersion());
+        JsonObject json = JsonParser.parseString(GsonUtils.GSON.toJson(attachment)).getAsJsonObject();
+        Assertions.assertEquals(version, json.get("kafkaSourceGuardVersion").getAsInt());
+        RLTaskTxnCommitAttachment persisted = (RLTaskTxnCommitAttachment) GsonUtils.GSON.fromJson(
+                json, TxnCommitAttachment.class);
+        Assertions.assertEquals(version, persisted.getKafkaSourceGuardVersion());
+        Assertions.assertEquals(descriptor, persisted.getKafkaSourceDescriptor());
+
+        TxnCommitAttachmentPB proto = TxnUtil.rlTaskTxnCommitAttachmentToPb(attachment);
+        Assertions.assertTrue(proto.getRlTaskTxnCommitAttachment().hasKafkaSourceGuardVersion());
+        Assertions.assertEquals(version, proto.getRlTaskTxnCommitAttachment().getKafkaSourceGuardVersion());
+        RLTaskTxnCommitAttachment restored = TxnUtil.rtTaskTxnCommitAttachmentFromPb(proto);
+        Assertions.assertEquals(version, restored.getKafkaSourceGuardVersion());
+        Assertions.assertEquals(descriptor, restored.getKafkaSourceDescriptor());
+        TxnCommitAttachmentPB repeated = TxnUtil.rlTaskTxnCommitAttachmentToPb(restored);
+        Assertions.assertTrue(repeated.getRlTaskTxnCommitAttachment().hasKafkaSourceGuardVersion());
+        Assertions.assertEquals(version, repeated.getRlTaskTxnCommitAttachment().getKafkaSourceGuardVersion());
+    }
+
+    @Test
+    public void testNegativeGuardProofVersionsAreRejected() {
+        Assertions.assertThrows(IllegalArgumentException.class,
+                () -> new RLTaskTxnCommitAttachment(thriftAttachment().setKafkaSourceGuardVersion(-1)));
+        RLTaskTxnCommitAttachment attachment = new RLTaskTxnCommitAttachment(thriftAttachment());
+        TxnCommitAttachmentPB proto = TxnUtil.rlTaskTxnCommitAttachmentToPb(attachment);
+        Assertions.assertThrows(IllegalArgumentException.class,
+                () -> new RLTaskTxnCommitAttachment(proto.getRlTaskTxnCommitAttachment().toBuilder()
+                        .setKafkaSourceGuardVersion(-1).build()));
+        JsonObject json = JsonParser.parseString(GsonUtils.GSON.toJson(attachment)).getAsJsonObject();
+        json.addProperty("kafkaSourceGuardVersion", -1);
+        Assertions.assertThrows(IllegalArgumentException.class,
+                () -> GsonUtils.GSON.fromJson(json, RLTaskTxnCommitAttachment.class));
+    }
+
+    @Test
+    public void testKafkaRollbackProofNeedsKafkaProgressWithoutRequiringSourceDescriptor() {
+        TRLTaskTxnCommitAttachment thrift = thriftAttachment().setKafkaSourceGuardVersion(1);
+        thrift.unsetKafkaSourceDescriptor();
+        RLTaskTxnCommitAttachment attachment = new RLTaskTxnCommitAttachment(thrift);
+        Assertions.assertEquals(1, attachment.getKafkaSourceGuardVersion());
+        Assertions.assertNull(attachment.getKafkaSourceDescriptor());
+        String json = GsonUtils.GSON.toJson(attachment);
+        RLTaskTxnCommitAttachment persisted = GsonUtils.GSON.fromJson(json, RLTaskTxnCommitAttachment.class);
+        Assertions.assertEquals(1, persisted.getKafkaSourceGuardVersion());
+        Assertions.assertNull(persisted.getKafkaSourceDescriptor());
+        TxnCommitAttachmentPB proto = TxnUtil.rlTaskTxnCommitAttachmentToPb(attachment);
+        Assertions.assertTrue(proto.getRlTaskTxnCommitAttachment().hasKafkaSourceGuardVersion());
+        Assertions.assertFalse(proto.getRlTaskTxnCommitAttachment().hasKafkaSourceDescriptor());
+        Assertions.assertTrue(proto.getRlTaskTxnCommitAttachment().hasProgress());
+        Assertions.assertThrows(IllegalArgumentException.class,
+                () -> new RLTaskTxnCommitAttachment(proto.getRlTaskTxnCommitAttachment().toBuilder()
+                        .clearProgress().build()));
+        RLTaskTxnCommitAttachment restored = TxnUtil.rtTaskTxnCommitAttachmentFromPb(proto);
+        Assertions.assertEquals(1, restored.getKafkaSourceGuardVersion());
+        Assertions.assertNull(restored.getKafkaSourceDescriptor());
+        Assertions.assertThrows(IllegalArgumentException.class,
+                () -> new RLTaskTxnCommitAttachment(thrift.deepCopy().setLoadSourceType(TLoadSourceType.KINESIS)));
+        TRLTaskTxnCommitAttachment missingProgress = thrift.deepCopy();
+        missingProgress.unsetKafkaRLTaskProgress();
+        Assertions.assertThrows(IllegalArgumentException.class,
+                () -> new RLTaskTxnCommitAttachment(missingProgress));
+
+        JsonObject kinesis = JsonParser.parseString(json).getAsJsonObject();
+        kinesis.add("pro", GsonUtils.GSON.toJsonTree(new KinesisProgress()));
+        JsonObject absent = JsonParser.parseString(json).getAsJsonObject();
+        absent.remove("pro");
+        JsonObject empty = JsonParser.parseString(json).getAsJsonObject();
+        empty.add("pro", JsonNull.INSTANCE);
+        for (JsonObject invalid : Arrays.asList(kinesis, absent, empty)) {
+            Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> GsonUtils.GSON.fromJson(invalid, RLTaskTxnCommitAttachment.class));
+        }
     }
 
     @Test

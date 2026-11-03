@@ -761,6 +761,27 @@ void BaseBackendService::submit_routine_load_task(TStatus& t_status,
     return Status::OK().to_thrift(&t_status);
 }
 
+void BaseBackendService::submit_guarded_routine_load_task(
+        TStatus& t_status, const std::vector<TRoutineLoadTask>& tasks) {
+    for (const auto& task : tasks) {
+        auto status =
+                RoutineLoadTaskExecutor::validate_task(task, KafkaLoadInfo::SOURCE_GUARD_VERSION);
+        if (!status.ok()) {
+            return status.to_thrift(&t_status);
+        }
+    }
+    for (const auto& task : tasks) {
+        auto status = _exec_env->routine_load_task_executor()->submit_task(
+                task, KafkaLoadInfo::SOURCE_GUARD_VERSION);
+        if (!status.ok()) {
+            LOG(WARNING) << "failed to submit guarded routine load task. job id: " << task.job_id
+                         << " task id: " << task.id;
+            return status.to_thrift(&t_status);
+        }
+    }
+    return Status::OK().to_thrift(&t_status);
+}
+
 /*
  * 1. validate user privilege (todo)
  * 2. FragmentMgr#exec_plan_fragment

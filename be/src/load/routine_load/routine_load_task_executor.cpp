@@ -33,8 +33,10 @@
 #include <thread>
 #include <utility>
 
+#include "cloud/config.h"
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/config.h"
+#include "common/env_config.h"
 #include "common/logging.h"
 #include "common/metrics/doris_metrics.h"
 #include "common/metrics/metrics.h"
@@ -253,10 +255,59 @@ Status RoutineLoadTaskExecutor::get_kafka_real_offsets_for_partitions(
     return st;
 }
 
-Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
+Status RoutineLoadTaskExecutor::validate_task(const TRoutineLoadTask& task,
+                                              int32_t accepted_guard_version) {
+    const int32_t requested_version =
+            task.__isset.kafka_source_guard_version ? task.kafka_source_guard_version : 0;
+    if (accepted_guard_version == 0) {
+        if (requested_version != 0) {
+            return Status::InvalidArgument(
+                    "Kafka source guarded tasks require the guarded submit RPC");
+        }
+        return Status::OK();
+    }
+    if (accepted_guard_version != KafkaLoadInfo::SOURCE_GUARD_VERSION ||
+        requested_version != accepted_guard_version) {
+        return Status::InvalidArgument("Unsupported Kafka source guard version");
+    }
+#ifndef HAVE_RDKAFKA_MESSAGE_TOPIC_ID
+    return Status::NotSupported(
+            "Kafka source guarded tasks require the delivered topic identity API");
+#else
+    if (!config::enable_kafka_share_completion_filtering || config::is_cloud_mode()) {
+        return Status::InvalidArgument(
+                "Kafka source guarded tasks require non-cloud completion filtering");
+    }
+    if (task.type != TLoadSourceType::KAFKA || !task.__isset.kafka_load_info ||
+        !task.kafka_load_info.__isset.use_share_consumer ||
+        !task.kafka_load_info.use_share_consumer ||
+        !task.kafka_load_info.partition_begin_offset.empty() ||
+        (task.__isset.is_multi_table && task.is_multi_table) ||
+        (task.__isset.cloud_cluster && !task.cloud_cluster.empty()) || task.job_id <= 0 ||
+        task.txn_id <= 0) {
+        return Status::InvalidArgument(
+                "Kafka source guarded tasks require a single-table Kafka share task");
+    }
+    return Status::OK();
+#endif
+}
+
+Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task,
+                                            int32_t accepted_guard_version) {
+    RETURN_IF_ERROR(validate_task(task, accepted_guard_version));
     std::unique_lock<std::mutex> l(_lock);
     // check if already submitted
-    if (_task_map.find(task.id) != _task_map.end()) {
+    auto existing_task = _task_map.find(task.id);
+    if (existing_task != _task_map.end()) {
+        const auto& existing = existing_task->second;
+        const int32_t existing_version =
+                existing->kafka_info ? existing->kafka_info->source_guard_version : 0;
+        if ((accepted_guard_version != 0 || existing_version != 0) &&
+            (existing_version != accepted_guard_version || existing->txn_id != task.txn_id ||
+             existing->job_id != task.job_id)) {
+            return Status::InvalidArgument(
+                    "Kafka source guarded task identity changed during resubmission");
+        }
         LOG(INFO) << "routine load task " << UniqueId(task.id) << " has already been submitted";
         return Status::OK();
     }
@@ -360,6 +411,7 @@ Status RoutineLoadTaskExecutor::submit_task(const TRoutineLoadTask& task) {
     switch (task.type) {
     case TLoadSourceType::KAFKA:
         ctx->kafka_info.reset(new KafkaLoadInfo(task.kafka_load_info));
+        ctx->kafka_info->source_guard_version = accepted_guard_version;
         break;
     case TLoadSourceType::KINESIS:
         ctx->kinesis_info.reset(new KinesisLoadInfo(task.kinesis_load_info));
