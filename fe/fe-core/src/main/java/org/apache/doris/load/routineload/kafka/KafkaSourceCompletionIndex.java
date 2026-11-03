@@ -103,8 +103,7 @@ public final class KafkaSourceCompletionIndex {
         long reservedPartitions = 0;
         long reservedRanges = 0;
         long reservedIdentityBytes = 0;
-        long sourceIdentityBytes = FIXED_IDENTITY_BYTES
-                + descriptor.getClusterId().getBytes(StandardCharsets.UTF_8).length;
+        long sourceIdentityBytes = SourceKey.identityBytes(descriptor.getClusterId());
         for (Partition partition : descriptor.getPartitions()) {
             SourceKey key = SourceKey.of(descriptor, partition);
             RangeSet<Long> existing = completed.get(key);
@@ -145,6 +144,20 @@ public final class KafkaSourceCompletionIndex {
         }
         return new AdditionPlan(additions, nextPartitionCount, nextRangeCount, nextIdentityBytes,
                 new ReservationCapacity(reservedPartitions, reservedRanges, reservedIdentityBytes));
+    }
+
+    synchronized boolean overlaps(KafkaSourceDescriptor query) {
+        for (Partition partition : query.getPartitions()) {
+            RangeSet<Long> existing = completed.get(SourceKey.of(query, partition));
+            if (existing != null) {
+                for (OffsetRange range : partition.getRanges()) {
+                    if (!existing.subRangeSet(toRange(range)).isEmpty()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     // Missing completion evidence does not establish that an offset is new.
@@ -240,11 +253,15 @@ public final class KafkaSourceCompletionIndex {
         return offsets.build();
     }
 
-    private record SourceKey(long namespaceId, String clusterId, long topicIdHi, long topicIdLo, int partition)
+    record SourceKey(long namespaceId, String clusterId, long topicIdHi, long topicIdLo, int partition)
             implements Comparable<SourceKey> {
-        private static SourceKey of(KafkaSourceDescriptor descriptor, Partition partition) {
+        static SourceKey of(KafkaSourceDescriptor descriptor, Partition partition) {
             return new SourceKey(descriptor.getNamespaceId(), descriptor.getClusterId(),
                     partition.getTopicIdHi(), partition.getTopicIdLo(), partition.getPartition());
+        }
+
+        static long identityBytes(String clusterId) {
+            return FIXED_IDENTITY_BYTES + clusterId.getBytes(StandardCharsets.UTF_8).length;
         }
 
         @Override

@@ -36,6 +36,8 @@ public final class KafkaSourceCompletionLedger {
     private final long maxIdentityBytes;
     private final int maxPendingTransactions;
     private final Map<Long, Reservation> pending = new HashMap<>();
+    private final Map<Long, NamespaceReservations> namespaceReservations = new HashMap<>();
+    private final KafkaSourcePendingClaims pendingClaims;
     private volatile KafkaSourceCompletionIndex index;
     private long reservedPartitions;
     private long reservedRanges;
@@ -49,16 +51,42 @@ public final class KafkaSourceCompletionLedger {
         this.maxIdentityBytes = maxIdentityBytes;
         this.maxPendingTransactions = maxPendingTransactions;
         this.index = new KafkaSourceCompletionIndex(maxSourcePartitions, maxOffsetRanges, maxIdentityBytes);
+        this.pendingClaims = new KafkaSourcePendingClaims(maxSourcePartitions, maxOffsetRanges, maxIdentityBytes);
     }
 
     public synchronized Reservation reserve(long transactionId, KafkaSourceDescriptor descriptor)
             throws CapacityExceededException {
+        try {
+            return reserve(transactionId, descriptor, false);
+        } catch (SourceConflictException e) {
+            throw new IllegalStateException(e.getMessage(), e);
+        }
+    }
+
+    public synchronized Reservation reserveExclusive(long transactionId, KafkaSourceDescriptor descriptor)
+            throws CapacityExceededException, SourceConflictException {
+        return reserve(transactionId, descriptor, true);
+    }
+
+    private Reservation reserve(long transactionId, KafkaSourceDescriptor descriptor, boolean exclusive)
+            throws CapacityExceededException, SourceConflictException {
         Preconditions.checkArgument(transactionId > 0, "Kafka source transaction ID must be positive");
         Reservation existing = pending.get(transactionId);
         if (existing != null) {
             Preconditions.checkState(existing.descriptor.equals(descriptor),
                     "Kafka source reservation identity changed for transaction %s", transactionId);
+            Preconditions.checkState(existing.exclusive == exclusive,
+                    "Kafka source reservation mode changed for transaction %s", transactionId);
             return existing;
+        }
+        NamespaceReservations namespace = namespaceReservations.get(descriptor.getNamespaceId());
+        if (namespace != null && namespace.exclusive != exclusive) {
+            throw new SourceConflictException("Kafka source reservation mode conflicts for namespace "
+                    + descriptor.getNamespaceId());
+        }
+        if (exclusive && index.overlaps(descriptor)) {
+            throw new SourceConflictException("Kafka source records are already completed for transaction "
+                    + transactionId);
         }
         ReservationCapacity capacity = index.reservationCapacity(descriptor);
         long nextPartitions = Math.addExact(reservedPartitions, capacity.sourcePartitions());
@@ -76,8 +104,13 @@ public final class KafkaSourceCompletionLedger {
                     + maxOffsetRanges + ", identityBytes=" + index.getIdentityBytes() + "+" + nextIdentityBytes
                     + "/" + maxIdentityBytes);
         }
-        Reservation reservation = new Reservation(this, transactionId, descriptor, capacity);
+        Reservation reservation = new Reservation(this, transactionId, descriptor, capacity, exclusive);
+        if (exclusive) {
+            pendingClaims.reserve(transactionId, descriptor);
+        }
         pending.put(transactionId, reservation);
+        namespaceReservations.put(descriptor.getNamespaceId(),
+                new NamespaceReservations(exclusive, namespace == null ? 1 : namespace.count + 1));
         reservedPartitions = nextPartitions;
         reservedRanges = nextRanges;
         reservedIdentityBytes = nextIdentityBytes;
@@ -112,7 +145,19 @@ public final class KafkaSourceCompletionLedger {
     }
 
     private void removeReservation(Reservation reservation) {
+        NamespaceReservations namespace = namespaceReservations.get(reservation.descriptor.getNamespaceId());
+        Preconditions.checkState(namespace != null && namespace.exclusive == reservation.exclusive,
+                "Kafka source namespace reservation is missing or has a different mode");
+        if (reservation.exclusive) {
+            pendingClaims.remove(reservation.transactionId, reservation.descriptor);
+        }
         pending.remove(reservation.transactionId);
+        if (namespace.count == 1) {
+            namespaceReservations.remove(reservation.descriptor.getNamespaceId());
+        } else {
+            namespaceReservations.put(reservation.descriptor.getNamespaceId(),
+                    new NamespaceReservations(namespace.exclusive, namespace.count - 1));
+        }
         reservedPartitions -= reservation.capacity.sourcePartitions();
         reservedRanges -= reservation.capacity.offsetRanges();
         reservedIdentityBytes -= reservation.capacity.identityBytes();
@@ -155,6 +200,18 @@ public final class KafkaSourceCompletionLedger {
         return reservedRanges;
     }
 
+    public synchronized long getPendingClaimPartitionCount() {
+        return pendingClaims.getSourcePartitionCount();
+    }
+
+    public synchronized long getPendingClaimRangeCount() {
+        return pendingClaims.getOffsetRangeCount();
+    }
+
+    public synchronized long getPendingClaimIdentityBytes() {
+        return pendingClaims.getIdentityBytes();
+    }
+
     public synchronized long getSourcePartitionCount() {
         return index.getSourcePartitionCount();
     }
@@ -187,20 +244,31 @@ public final class KafkaSourceCompletionLedger {
         index = new KafkaSourceCompletionIndex(maxSourcePartitions, maxOffsetRanges, maxIdentityBytes);
     }
 
+    private record NamespaceReservations(boolean exclusive, int count) {
+    }
+
+    public static final class SourceConflictException extends Exception {
+        public SourceConflictException(String message) {
+            super(message);
+        }
+    }
+
     public static final class Reservation {
         private final KafkaSourceCompletionLedger owner;
         private final long transactionId;
         private final KafkaSourceDescriptor descriptor;
         private final ReservationCapacity capacity;
+        private final boolean exclusive;
         private boolean published;
         private boolean released;
 
         private Reservation(KafkaSourceCompletionLedger owner, long transactionId, KafkaSourceDescriptor descriptor,
-                ReservationCapacity capacity) {
+                ReservationCapacity capacity, boolean exclusive) {
             this.owner = owner;
             this.transactionId = transactionId;
             this.descriptor = descriptor;
             this.capacity = capacity;
+            this.exclusive = exclusive;
         }
     }
 }
