@@ -505,6 +505,10 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " LIBRDKAFKA " ]]; then
             patch -p0 <"${TP_PATCH_DIR}/librdkafka-2.16.0.patch"
             touch "${PATCHED_MARK}"
         fi
+        if [[ ! -f "patched_mark_message_topic_id_v1" ]]; then
+            patch -p1 <"${TP_PATCH_DIR}/librdkafka-2.16.0-message-topic-id.patch"
+            touch "patched_mark_message_topic_id_v1"
+        fi
         cd -
     fi
     echo "Finished patching ${LIBRDKAFKA_SOURCE}"
