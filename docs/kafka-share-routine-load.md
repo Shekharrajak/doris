@@ -73,6 +73,16 @@ With FE completion tracking enabled and all nodes upgraded, set
 `enable_kafka_share_completion_filtering=true` in `be.conf` and restart the BEs.
 This requires a librdkafka build exposing the delivered message topic UUID API.
 
+The third-party build backports that API to the pinned librdkafka 2.16.0 archive.
+Refresh older prebuilt SDK headers and libraries together, then rebuild the BEs:
+
+```bash
+./thirdparty/build-thirdparty.sh -j 1 librdkafka
+./build.sh --be -j 1
+```
+
+The SDK version alone does not establish that the API is present.
+
 Before appending, each batch queries FE for exact completed source identities.
 Completed records are acknowledged even if loading new records fails. Unknown
 records are loaded once per batch and acknowledged after their transaction commits.

@@ -1049,8 +1049,9 @@ build_librdkafka() {
         -lgssapi_krb5 -lkrb5 -lkrb5support -lk5crypto -lcom_err -lresolv" \
         ./configure --prefix="${TP_INSTALL_DIR}" --enable-static --enable-sasl --disable-c11threads
 
-    make -j "${PARALLEL}"
-    make install
+    make -j "${PARALLEL}" libs
+    # The release archive supplies CONFIGURATION.md; regenerating it builds every example.
+    make -o CONFIGURATION.md install
 
     remove_all_dylib
     strip_lib librdkafka.a

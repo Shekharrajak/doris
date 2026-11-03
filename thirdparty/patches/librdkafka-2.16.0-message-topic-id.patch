@@ -1,0 +1,506 @@
+# Backport from https://github.com/Shekharrajak/librdkafka/commit/f93eee29cd4b9d99f538eabf1c86e7dc631a959b
+# Upstream review: https://github.com/confluentinc/librdkafka/pull/5664
+
+diff --git a/src/rdkafka.h b/src/rdkafka.h
+index ce3a66c..cb6420e 100644
+--- a/src/rdkafka.h
++++ b/src/rdkafka.h
+@@ -1776,7 +1776,23 @@ RD_EXPORT int16_t
+ rd_kafka_message_delivery_count(const rd_kafka_message_t *rkmessage);
+-
+-
++
++
++/**
++ * @brief Get the topic UUID from the response that delivered a share-consumer
++ *        message.
++ *
++ * @returns The topic UUID, or NULL for NULL, errored, producer, or non-share
++ *          messages, or if the UUID is unavailable.
++ *
++ * @remark The UUID remains unchanged if the topic is deleted and recreated.
++ *         It is owned by the message and valid until the message or its
++ *         containing rd_kafka_messages_t is destroyed. Use rd_kafka_Uuid_copy()
++ *         to retain it longer. Do not destroy the returned UUID.
++ */
++RD_EXPORT const rd_kafka_Uuid_t *
++rd_kafka_message_topic_id(const rd_kafka_message_t *rkmessage);
++
++
+ /**@}*/
+-
+-
++
++
+ /**
+diff --git a/src/rdkafka_fetcher.c b/src/rdkafka_fetcher.c
+index 6a29c79..8f6ba00 100644
+--- a/src/rdkafka_fetcher.c
++++ b/src/rdkafka_fetcher.c
+@@ -1103,6 +1103,10 @@ rd_kafka_share_build_response_rko(rd_kafka_broker_t *rkb,
+                         entry->types[offset - entry->start_offset] =
+                             rd_kafka_share_ack_type_from_msg_op(msg_rko);
+-
++
++                        if (msg_rko->rko_type == RD_KAFKA_OP_FETCH)
++                                msg_rko->rko_u.fetch.topic_id =
++                                    parpriv->topic_id;
++
+                         /**
+                          * The per message error ops (Decompression error, CRC
+                          * error, or MagicByte Errors are tracked in the same
+diff --git a/src/rdkafka_msg.c b/src/rdkafka_msg.c
+index 34a2f54..73cb315 100644
+--- a/src/rdkafka_msg.c
++++ b/src/rdkafka_msg.c
+@@ -1623,6 +1623,27 @@ int16_t rd_kafka_message_delivery_count(const rd_kafka_message_t *rkmessage) {
+ }
+-
+-
++
++
++const rd_kafka_Uuid_t *
++rd_kafka_message_topic_id(const rd_kafka_message_t *rkmessage) {
++        rd_kafka_msg_t *rkm;
++        rd_kafka_op_t *rko;
++
++        if (!rkmessage || rkmessage->err)
++                return NULL;
++
++        rkm = rd_kafka_message2msg((rd_kafka_message_t *)rkmessage);
++        /* Producer _private may be application opaque, not a FETCH owner. */
++        if (rkm->rkm_flags & RD_KAFKA_MSG_F_PRODUCER)
++                return NULL;
++
++        rko = rd_kafka_message2rko((rd_kafka_message_t *)rkmessage);
++        if (!rko || RD_KAFKA_UUID_IS_ZERO(rko->rko_u.fetch.topic_id))
++                return NULL;
++
++        return &rko->rko_u.fetch.topic_id;
++}
++
++
+ void rd_kafka_msgq_dump(FILE *fp, const char *what, rd_kafka_msgq_t *rkmq) {
+         rd_kafka_msg_t *rkm;
+         int cnt = 0;
+diff --git a/src/rdkafka_op.h b/src/rdkafka_op.h
+index c951859..43bc49e 100644
+--- a/src/rdkafka_op.h
++++ b/src/rdkafka_op.h
+@@ -357,6 +357,7 @@ struct rd_kafka_op_s {
+                         rd_kafka_buf_t *rkbuf;
+                         rd_kafka_msg_t rkm;
+                         int evidx;
++                        rd_kafka_Uuid_t topic_id; /**< Acquired topic UUID. */
+                 } fetch;
+-
++
+                 struct {
+diff --git a/tests/0006-symbols.c b/tests/0006-symbols.c
+index 1e5378c..1cb26e1 100644
+--- a/tests/0006-symbols.c
++++ b/tests/0006-symbols.c
+@@ -97,6 +97,7 @@ int main_0006_symbols(int argc, char **argv) {
+                 rd_kafka_message_destroy(NULL);
+                 rd_kafka_message_errstr(NULL);
+                 rd_kafka_message_timestamp(NULL, NULL);
++                rd_kafka_message_topic_id(NULL);
+                 rd_kafka_consume_start(NULL, 0, 0);
+                 rd_kafka_consume_stop(NULL, 0);
+                 rd_kafka_consume(NULL, 0, 0);
+diff --git a/tests/0156-share_consumer_fetch_mock.c b/tests/0156-share_consumer_fetch_mock.c
+index 1f35f59..2c3ea76 100644
+--- a/tests/0156-share_consumer_fetch_mock.c
++++ b/tests/0156-share_consumer_fetch_mock.c
+@@ -44,6 +44,14 @@ typedef struct test_ctx_s {
+         const char *bootstraps;
+ } test_ctx_t;
+-
++
++static void topic_id_dr_msg_cb(rd_kafka_t *rk,
++                               const rd_kafka_message_t *message,
++                               void *opaque) {
++        TEST_ASSERT(rd_kafka_message_topic_id(message) == NULL,
++                    "Producer message must not expose a share topic ID");
++        test_dr_msg_cb(rk, message, opaque);
++}
++
+ static test_ctx_t test_ctx_new(void) {
+         test_ctx_t ctx;
+         rd_kafka_conf_t *conf;
+@@ -69,7 +77,7 @@ static test_ctx_t test_ctx_new(void) {
+         /* Create a producer targeting the mock cluster */
+         test_conf_init(&conf, NULL, 0);
+         test_conf_set(conf, "bootstrap.servers", ctx.bootstraps);
+-        rd_kafka_conf_set_dr_msg_cb(conf, test_dr_msg_cb);
+-
++        rd_kafka_conf_set_dr_msg_cb(conf, topic_id_dr_msg_cb);
++
+         ctx.producer =
+             rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+@@ -254,6 +262,150 @@ static void do_test_empty_topic_no_records(void) {
+         SUB_TEST_PASS();
+ }
+-
++
++static void do_test_message_topic_id(void) {
++        const char *topics[] = {"share_topic_id_a", "share_topic_id_b"};
++        const int records_per_partition = 6;
++        int seen[2][2][6]               = {{{0}}};
++        rd_kafka_Uuid_t *topic_ids[2]   = {NULL, NULL};
++        rd_kafka_share_t *consumer;
++        rd_kafka_conf_t *conf;
++        rd_kafka_t *classic;
++        rd_kafka_message_t *message;
++        rd_kafka_message_t error_message = {0};
++        test_ctx_t ctx;
++        rd_ts_t deadline;
++        int received = 0;
++        int topic, partition, offset;
++
++        SUB_TEST_QUICK();
++
++        TEST_ASSERT(rd_kafka_message_topic_id(NULL) == NULL,
++                    "NULL message must not expose a topic ID");
++        error_message.err = RD_KAFKA_RESP_ERR__BAD_MSG;
++        TEST_ASSERT(rd_kafka_message_topic_id(&error_message) == NULL,
++                    "Error message must not expose a topic ID");
++
++        ctx = test_ctx_new();
++        for (topic = 0; topic < 2; topic++) {
++                TEST_ASSERT(rd_kafka_mock_topic_create(ctx.mcluster,
++                                                       topics[topic], 2, 1) ==
++                                RD_KAFKA_RESP_ERR_NO_ERROR,
++                            "Failed to create mock topic");
++                for (partition = 0; partition < 2; partition++)
++                        test_produce_msgs2(ctx.producer, topics[topic], 0,
++                                           partition, 0, records_per_partition,
++                                           NULL, 0);
++        }
++
++        test_conf_init(&conf, NULL, 0);
++        test_conf_set(conf, "bootstrap.servers", ctx.bootstraps);
++        test_conf_set(conf, "group.id", "share-topic-id");
++        test_conf_set(conf, "share.acknowledgement.mode", "explicit");
++        consumer = rd_kafka_share_consumer_new(conf, NULL, 0);
++        TEST_ASSERT(consumer != NULL, "Failed to create share consumer");
++        subscribe_topics(consumer, topics, 2);
++
++        deadline = test_clock() + (rd_ts_t)30 * 1000 * 1000;
++        while (received < 32 && test_clock() < deadline) {
++                rd_kafka_messages_t *batch               = NULL;
++                rd_kafka_topic_partition_list_t *results = NULL;
++                rd_kafka_error_t *error;
++                size_t i;
++
++                error = rd_kafka_share_poll(consumer, 500, &batch);
++                TEST_ASSERT(error == NULL, "Share poll failed: %s",
++                            error ? rd_kafka_error_string(error) : "");
++                for (i = 0; i < rd_kafka_messages_count(batch); i++) {
++                        const rd_kafka_Uuid_t *id;
++                        rd_kafka_share_AcknowledgeType_t type;
++                        int *count;
++                        message = rd_kafka_messages_get(batch, i);
++                        TEST_ASSERT(!message->err, "Unexpected message error");
++                        topic = !strcmp(rd_kafka_topic_name(message->rkt),
++                                        topics[0])
++                                    ? 0
++                                    : 1;
++                        TEST_ASSERT(!strcmp(rd_kafka_topic_name(message->rkt),
++                                            topics[topic]),
++                                    "Unexpected topic");
++                        partition = message->partition;
++                        offset    = (int)message->offset;
++                        TEST_ASSERT(partition >= 0 && partition < 2 &&
++                                        offset >= 0 &&
++                                        offset < records_per_partition,
++                                    "Unexpected partition/offset");
++                        id = rd_kafka_message_topic_id(message);
++                        TEST_ASSERT(id != NULL, "Share topic ID unavailable");
++                        TEST_ASSERT(
++                            rd_kafka_Uuid_most_significant_bits(id) ||
++                                rd_kafka_Uuid_least_significant_bits(id),
++                            "Share topic ID is zero");
++                        if (!topic_ids[topic])
++                                topic_ids[topic] = rd_kafka_Uuid_copy(id);
++                        TEST_ASSERT(
++                            !strcmp(rd_kafka_Uuid_base64str(id),
++                                    rd_kafka_Uuid_base64str(topic_ids[topic])),
++                            "Topic ID changed across partitions/polls");
++                        count = &seen[topic][partition][offset];
++                        ++*count;
++                        TEST_ASSERT(
++                            *count <= (offset == 1 || offset == 4 ? 2 : 1),
++                            "Unexpected duplicate at offset %d", offset);
++                        TEST_ASSERT(rd_kafka_message_delivery_count(message) ==
++                                        *count,
++                                    "Unexpected delivery count");
++                        type = *count == 1 && (offset == 1 || offset == 4)
++                                   ? RD_KAFKA_SHARE_ACKNOWLEDGE_TYPE_RELEASE
++                                   : RD_KAFKA_SHARE_ACKNOWLEDGE_TYPE_ACCEPT;
++                        TEST_ASSERT(rd_kafka_share_acknowledge_type(
++                                        consumer, message, type) ==
++                                        RD_KAFKA_RESP_ERR_NO_ERROR,
++                                    "Acknowledgement failed");
++                        received++;
++                }
++                error = rd_kafka_share_commit_sync(consumer, 5000, &results);
++                TEST_ASSERT(error == NULL, "Share commit failed: %s",
++                            error ? rd_kafka_error_string(error) : "");
++                if (results)
++                        rd_kafka_topic_partition_list_destroy(results);
++                rd_kafka_messages_destroy(batch);
++        }
++        TEST_ASSERT(received == 32, "Expected 32 deliveries, got %d", received);
++        TEST_ASSERT(strcmp(rd_kafka_Uuid_base64str(topic_ids[0]),
++                           rd_kafka_Uuid_base64str(topic_ids[1])),
++                    "Different topics exposed the same ID");
++        for (topic = 0; topic < 2; topic++)
++                for (partition = 0; partition < 2; partition++)
++                        for (offset = 0; offset < records_per_partition;
++                             offset++)
++                                TEST_ASSERT(
++                                    seen[topic][partition][offset] ==
++                                        (offset == 1 || offset == 4 ? 2 : 1),
++                                    "Missing source record");
++        test_share_consumer_close(consumer);
++        test_share_destroy(consumer);
++
++        test_conf_init(&conf, NULL, 0);
++        test_conf_set(conf, "bootstrap.servers", ctx.bootstraps);
++        classic = test_create_consumer("classic-topic-id", NULL, conf, NULL);
++        test_consumer_assign_partition("topic ID", classic, topics[0], 0,
++                                       RD_KAFKA_OFFSET_BEGINNING);
++        message  = NULL;
++        deadline = test_clock() + (rd_ts_t)10 * 1000 * 1000;
++        while (!message && test_clock() < deadline)
++                message = rd_kafka_consumer_poll(classic, 500);
++        TEST_ASSERT(message && !message->err, "Classic message unavailable");
++        TEST_ASSERT(rd_kafka_message_topic_id(message) == NULL,
++                    "Classic message must not expose a share topic ID");
++        rd_kafka_message_destroy(message);
++        test_consumer_close(classic);
++        rd_kafka_destroy(classic);
++        rd_kafka_Uuid_destroy(topic_ids[0]);
++        rd_kafka_Uuid_destroy(topic_ids[1]);
++        test_ctx_destroy(&ctx);
++        SUB_TEST_PASS();
++}
++
+ static int do_test_negative_sharefetch_error(rd_kafka_resp_err_t err) {
+         const char *topic = "kip932_neg_sharefetch_error";
+         test_ctx_t ctx    = test_ctx_new();
+@@ -1501,6 +1653,7 @@ int main_0156_share_consumer_fetch_mock(int argc, char **argv) {
+         do_test_followup_fetch();
+         do_test_multi_partition();
+         do_test_multi_topic();
++        do_test_message_topic_id();
+         do_test_empty_topic_no_records();
+         do_test_sharefetch_session_expiry_rtt();
+         do_test_forgotten_topics();
+diff --git a/tests/0184-share_consumer_topic_recreate.c b/tests/0184-share_consumer_topic_recreate.c
+index c391a52..ea01875 100644
+--- a/tests/0184-share_consumer_topic_recreate.c
++++ b/tests/0184-share_consumer_topic_recreate.c
+@@ -140,7 +140,8 @@ static void assert_topic_id_changed(const rd_kafka_Uuid_t *id_before,
+ static int consume_into_msgver(rd_kafka_share_t *rkshare,
+                                test_msgver_t *mv,
+                                int exp_cnt,
+-                               int timeout_ms) {
++                               int timeout_ms,
++                               const rd_kafka_Uuid_t *expected_topic_id) {
+         rd_kafka_messages_t *batch = NULL;
+         rd_ts_t deadline           = test_clock() + (rd_ts_t)timeout_ms * 1000;
+         rd_kafka_t *rk             = test_share_consumer_get_rk(rkshare);
+@@ -182,6 +183,18 @@ static int consume_into_msgver(rd_kafka_share_t *rkshare,
+                             rd_kafka_topic_name(m->rkt), m->partition,
+                             m->offset);
+-
++
++                        if (expected_topic_id) {
++                                const rd_kafka_Uuid_t *id =
++                                    rd_kafka_message_topic_id(m);
++                                TEST_ASSERT(id != NULL,
++                                            "Delivered topic ID unavailable");
++                                TEST_ASSERT(!strcmp(rd_kafka_Uuid_base64str(id),
++                                                    rd_kafka_Uuid_base64str(
++                                                        expected_topic_id)),
++                                            "Delivered topic ID differs from "
++                                            "broker ID");
++                        }
++
+                         /* msgver auto-filters by mv->testid; messages from
+                          * the other phase (or untagged) are silently
+                          * dropped. */
+@@ -388,8 +401,8 @@ static void do_test_recreate_two_phase(const char *label,
+         produce_phase(topic, testid_before, PARTITION_CNT);
+-
++
+         test_msgver_init(&mv_before, testid_before);
+-        got =
+-            consume_into_msgver(rkshare, &mv_before, MSGS_PER_PHASE, 30 * 1000);
++        got = consume_into_msgver(rkshare, &mv_before, MSGS_PER_PHASE,
++                                  30 * 1000, id_before);
+         TEST_ASSERT(got == MSGS_PER_PHASE,
+                     "Phase 1: expected %d msgs matching testid_before, "
+                     "got %d",
+@@ -414,8 +427,8 @@ static void do_test_recreate_two_phase(const char *label,
+         produce_phase(topic, testid_after, after_partition_cnt);
+-
++
+         test_msgver_init(&mv_after, testid_after);
+         got = consume_into_msgver(rkshare, &mv_after, msgs_per_phase_after,
+-                                  60 * 1000);
++                                  60 * 1000, id_after);
+         TEST_ASSERT(got == msgs_per_phase_after,
+                     "Phase 2: expected %d msgs matching testid_after, "
+                     "got %d (post-recreate)",
+@@ -512,8 +525,8 @@ static void do_test_recreate_chaos(void) {
+         produce_phase(topic, testid_warmup, PARTITION_CNT);
+-
++
+         test_msgver_init(&mv_warmup, testid_warmup);
+-        got =
+-            consume_into_msgver(rkshare, &mv_warmup, MSGS_PER_PHASE, 30 * 1000);
++        got = consume_into_msgver(rkshare, &mv_warmup, MSGS_PER_PHASE,
++                                  30 * 1000, NULL);
+         TEST_ASSERT(got == MSGS_PER_PHASE, "Warmup: expected %d msgs, got %d",
+                     MSGS_PER_PHASE, got);
+         test_msgver_clear(&mv_warmup);
+@@ -580,7 +593,8 @@ static void do_test_recreate_chaos(void) {
+         final_msgs = current_partition_cnt * MSGS_PER_PARTITION;
+-
++
+         test_msgver_init(&mv_final, testid_final);
+-        got = consume_into_msgver(rkshare, &mv_final, final_msgs, 60 * 1000);
++        got = consume_into_msgver(rkshare, &mv_final, final_msgs, 60 * 1000,
++                                  NULL);
+         TEST_ASSERT(got == final_msgs,
+                     "Settle: expected %d msgs matching testid_final, "
+                     "got %d after %d chaos cycles",
+@@ -1016,8 +1030,8 @@ static void do_test_recreate_stall_then_recover(void) {
+         /* ---- Phase 1: consume the original generation ---- */
+         produce_phase(topic, testid_before, PARTITION_CNT);
+         test_msgver_init(&mv_before, testid_before);
+-        got =
+-            consume_into_msgver(rkshare, &mv_before, MSGS_PER_PHASE, 30 * 1000);
++        got = consume_into_msgver(rkshare, &mv_before, MSGS_PER_PHASE,
++                                  30 * 1000, NULL);
+         TEST_ASSERT(got == MSGS_PER_PHASE, "Phase 1: expected %d msgs, got %d",
+                     MSGS_PER_PHASE, got);
+         test_msgver_clear(&mv_before);
+@@ -1062,8 +1076,8 @@ static void do_test_recreate_stall_then_recover(void) {
+         /* ---- Phase 2: records flow again ---- */
+         produce_phase(topic, testid_after, PARTITION_CNT);
+         test_msgver_init(&mv_after, testid_after);
+-        got =
+-            consume_into_msgver(rkshare, &mv_after, MSGS_PER_PHASE, 60 * 1000);
++        got = consume_into_msgver(rkshare, &mv_after, MSGS_PER_PHASE, 60 * 1000,
++                                  NULL);
+         TEST_ASSERT(got == MSGS_PER_PHASE,
+                     "Phase 2: expected %d msgs after recreate, got %d",
+                     MSGS_PER_PHASE, got);
+@@ -1149,14 +1163,19 @@ static void do_test_recreate_same_name_partition_collision(void) {
+         rd_kafka_conf_t *conf;
+         rd_kafka_conf_t *producer_conf;
+         rd_kafka_t *producer;
+-        const char *topic          = "0184-recreate-collision";
+-        const char *group          = "0184-share-recreate-collision";
+-        const int n_partitions     = 3;
+-        const int n_msgs_per_part  = 10;
+-        const int total_per_phase  = n_partitions * n_msgs_per_part;
+-        rd_kafka_messages_t *batch = NULL;
+-        int old_got                = 0;
+-        int new_got                = 0;
++        const char *topic                    = "0184-recreate-collision";
++        const char *group                    = "0184-share-recreate-collision";
++        const int n_partitions               = 3;
++        const int n_msgs_per_part            = 10;
++        const int total_per_phase            = n_partitions * n_msgs_per_part;
++        rd_kafka_messages_t *batch           = NULL;
++        rd_kafka_messages_t *retained_batch  = NULL;
++        rd_kafka_message_t *retained_message = NULL;
++        const rd_kafka_Uuid_t *retained_id   = NULL;
++        rd_kafka_Uuid_t *old_id              = NULL;
++        rd_kafka_Uuid_t *new_id              = NULL;
++        int old_got                          = 0;
++        int new_got                          = 0;
+         rd_ts_t deadline;
+         int32_t p;
+         char **member_ids;
+@@ -1239,11 +1258,27 @@ static void do_test_recreate_same_name_partition_collision(void) {
+                 for (i = 0; i < cnt; i++) {
+                         rd_kafka_message_t *m = rd_kafka_messages_get(batch, i);
+                         if (!m->err) {
++                                const rd_kafka_Uuid_t *id =
++                                    rd_kafka_message_topic_id(m);
++                                TEST_ASSERT(
++                                    id != NULL,
++                                    "Old acquisition topic ID unavailable");
++                                if (!retained_batch) {
++                                        retained_batch   = batch;
++                                        retained_message = m;
++                                        retained_id      = id;
++                                        old_id = rd_kafka_Uuid_copy(id);
++                                }
++                                TEST_ASSERT(
++                                    !strcmp(rd_kafka_Uuid_base64str(id),
++                                            rd_kafka_Uuid_base64str(old_id)),
++                                    "Old partition topic IDs differ");
+                                 old_got++;
+                                 rd_kafka_share_acknowledge(rkshare, m);
+                         }
+                 }
+-                rd_kafka_messages_destroy(batch);
++                if (batch != retained_batch)
++                        rd_kafka_messages_destroy(batch);
+                 batch = NULL;
+         }
+         TEST_ASSERT(old_got == total_per_phase,
+@@ -1325,6 +1360,21 @@ static void do_test_recreate_same_name_partition_collision(void) {
+                 for (i = 0; i < cnt; i++) {
+                         rd_kafka_message_t *m = rd_kafka_messages_get(batch, i);
+                         if (!m->err) {
++                                const rd_kafka_Uuid_t *id =
++                                    rd_kafka_message_topic_id(m);
++                                TEST_ASSERT(
++                                    id != NULL,
++                                    "New acquisition topic ID unavailable");
++                                TEST_ASSERT(
++                                    strcmp(rd_kafka_Uuid_base64str(id),
++                                           rd_kafka_Uuid_base64str(old_id)),
++                                    "Recreated topic retained its old ID");
++                                if (!new_id)
++                                        new_id = rd_kafka_Uuid_copy(id);
++                                TEST_ASSERT(
++                                    !strcmp(rd_kafka_Uuid_base64str(id),
++                                            rd_kafka_Uuid_base64str(new_id)),
++                                    "New partition topic IDs differ");
+                                 new_got++;
+                                 rd_kafka_share_acknowledge(rkshare, m);
+                         }
+@@ -1339,6 +1389,16 @@ static void do_test_recreate_same_name_partition_collision(void) {
+                     "suppressed the NEW rktp adds because (name, partition) "
+                     "collided with OLD-id entries in rkcg_group_assignment.",
+                     total_per_phase, new_got);
+-
++        TEST_ASSERT(!strcmp(rd_kafka_Uuid_base64str(retained_id),
++                            rd_kafka_Uuid_base64str(old_id)),
++                    "Borrowed topic ID changed after topic recreation");
++        TEST_ASSERT(!strcmp(rd_kafka_Uuid_base64str(
++                                rd_kafka_message_topic_id(retained_message)),
++                            rd_kafka_Uuid_base64str(old_id)),
++                    "Retained message resolved the recreated topic ID");
++        rd_kafka_messages_destroy(retained_batch);
++        rd_kafka_Uuid_destroy(old_id);
++        rd_kafka_Uuid_destroy(new_id);
++
+         for (mi = 0; mi < member_cnt; mi++)
+                 rd_free(member_ids[mi]);
+@@ -1357,4 +1417,4 @@ int main_0184_share_consumer_topic_recreate_local(int argc, char **argv) {
+         test_recreate_during_close();
+         do_test_recreate_same_name_partition_collision();
+         return 0;
+-}
+\ No newline at end of file
++}
