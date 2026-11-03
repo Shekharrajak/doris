@@ -34,10 +34,52 @@ import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 public class DataSourcePropertiesTest {
+
+    @Test
+    public void testGuardedSharePropertyIsCreationOnly() throws UserException {
+        Map<String, String> source = new HashMap<>();
+        source.put("kafka_broker_list", "localhost:9092");
+        source.put("kafka_topic", "events");
+        KafkaDataSourceProperties legacy = new KafkaDataSourceProperties(source);
+        legacy.convertAndCheckDataSourceProperties();
+        Assertions.assertFalse(legacy.isShareGuardedCommit());
+
+        source.put(KafkaDataSourceProperties.KAFKA_SHARE_GUARDED_COMMIT, "true");
+        Assertions.assertThrows(UserException.class,
+                () -> new KafkaDataSourceProperties(source).convertAndCheckDataSourceProperties());
+        source.put(KafkaDataSourceProperties.KAFKA_CONSUMER_TYPE, "share");
+        KafkaDataSourceProperties guarded = new KafkaDataSourceProperties(source);
+        guarded.convertAndCheckDataSourceProperties();
+        Assertions.assertTrue(guarded.isShareGuardedCommit());
+        KafkaDataSourceProperties restored = (KafkaDataSourceProperties) GsonUtils.GSON.fromJson(
+                GsonUtils.GSON.toJson(guarded), AbstractDataSourceProperties.class);
+        Assertions.assertTrue(restored.isShareGuardedCommit());
+        Assertions.assertThrows(UserException.class,
+                () -> new KafkaDataSourceProperties(source, true).convertAndCheckDataSourceProperties());
+
+        for (String value : new String[] {"true", "false"}) {
+            Map<String, String> alter = new HashMap<>();
+            alter.put(KafkaDataSourceProperties.KAFKA_SHARE_GUARDED_COMMIT, value);
+            KafkaDataSourceProperties properties = new KafkaDataSourceProperties(alter);
+            properties.setAlter(true);
+            Assertions.assertThrows(UserException.class, properties::convertAndCheckDataSourceProperties);
+        }
+        for (String value : new String[] {"", "yes", "1"}) {
+            Map<String, String> invalid = new HashMap<>(source);
+            invalid.put(KafkaDataSourceProperties.KAFKA_SHARE_GUARDED_COMMIT, value);
+            Assertions.assertThrows(UserException.class,
+                    () -> new KafkaDataSourceProperties(invalid).convertAndCheckDataSourceProperties());
+        }
+        source.put(KafkaDataSourceProperties.KAFKA_SHARE_GUARDED_COMMIT, "false");
+        KafkaDataSourceProperties disabled = new KafkaDataSourceProperties(source);
+        disabled.convertAndCheckDataSourceProperties();
+        Assertions.assertFalse(disabled.isShareGuardedCommit());
+    }
 
     @Test
     public void testKafkaDataSourceSerializatio() throws IOException, UserException {

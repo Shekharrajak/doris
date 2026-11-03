@@ -2142,6 +2142,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
 
         // Step 5: commit and publish
         if (request.isSetTxnInsert() && request.isTxnInsert()) {
+            if (transactionState.getKafkaSourceGuardVersionRequired() != 0) {
+                throw new UserException("PAUSE: Guarded Kafka source commits do not support subtransactions");
+            }
             List<Long> subTxnIds = new ArrayList<>();
             List<SubTransactionState> subTransactionStates = new ArrayList<>();
             for (TSubTxnInfo subTxnInfo : request.getSubTxnInfos()) {

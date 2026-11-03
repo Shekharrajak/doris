@@ -78,6 +78,7 @@ import org.apache.commons.lang3.BooleanUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -135,9 +136,48 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
 
     @SerializedName(value = "useShareConsumer")
     private boolean useShareConsumer;
+    @SerializedName(value = "kafkaSourceGuardVersion")
+    private int kafkaSourceGuardVersion;
 
     public boolean isUseShareConsumer() {
         return useShareConsumer;
+    }
+
+    @Override
+    public int getKafkaSourceGuardVersion() {
+        return kafkaSourceGuardVersion;
+    }
+
+    @Override
+    public void gsonPostProcess() throws IOException {
+        super.gsonPostProcess();
+        if (kafkaSourceGuardVersion < 0 || kafkaSourceGuardVersion > 1) {
+            throw new IOException("Unsupported Kafka source guard version");
+        }
+        if (kafkaSourceGuardVersion > 0) {
+            try {
+                maxFilterRatio = Double.parseDouble(jobProperties.get(CreateRoutineLoadInfo.MAX_FILTER_RATIO_PROPERTY));
+                validateGuardedCommitProperties();
+            } catch (UserException | RuntimeException e) {
+                throw new IOException("Invalid guarded Kafka share job", e);
+            }
+        }
+    }
+
+    private void validateGuardedCommitProperties() throws DdlException {
+        if (!useShareConsumer || isMultiTable() || maxErrorNum != 0 || maxFilterRatio != 0
+                || !Boolean.parseBoolean(jobProperties.get(CreateRoutineLoadInfo.STRICT_MODE))
+                || whereExpr != null || precedingFilter != null) {
+            throw new DdlException("Guarded Kafka share commits require strict mode, zero error limits and no filters");
+        }
+    }
+
+    @Override
+    protected void validateReplayedCreateInfo(CreateRoutineLoadInfo info) throws UserException {
+        KafkaDataSourceProperties source = (KafkaDataSourceProperties) info.getDataSourceProperties();
+        if (source.isShareGuardedCommit() != (kafkaSourceGuardVersion > 0)) {
+            throw new DdlException("Kafka share guarded commit mode does not match persisted metadata");
+        }
     }
 
     public KafkaRoutineLoadJob() {
@@ -552,7 +592,7 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
     protected boolean needAutoResume() {
         writeLock();
         try {
-            if (this.state == JobState.PAUSED) {
+            if (this.state == JobState.PAUSED && kafkaSourceGuardVersion == 0) {
                 return ScheduleRule.isNeedAutoSchedule(this);
             }
             return false;
@@ -702,6 +742,13 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
         if (useShareConsumer && Config.isCloudMode()) {
             throw new DdlException("Share consumption is experimental and does not support cloud mode");
         }
+        kafkaSourceGuardVersion = kafkaDataSourceProperties.isShareGuardedCommit() ? 1 : 0;
+        if (kafkaSourceGuardVersion > 0) {
+            if (!Config.enable_kafka_source_completion_tracking) {
+                throw new DdlException("Guarded Kafka share commits require source completion tracking");
+            }
+            validateGuardedCommitProperties();
+        }
         if (MapUtils.isNotEmpty(kafkaDataSourceProperties.getCustomKafkaProperties())) {
             setCustomKafkaProperties(kafkaDataSourceProperties.getCustomKafkaProperties());
         }
@@ -748,6 +795,8 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
         dataSourceProperties.put("brokerList", brokerList);
         dataSourceProperties.put("topic", topic);
         dataSourceProperties.put("consumerType", useShareConsumer ? "share" : "standard");
+        dataSourceProperties.put(KafkaDataSourceProperties.KAFKA_SHARE_GUARDED_COMMIT,
+                String.valueOf(kafkaSourceGuardVersion > 0));
         List<Integer> sortedPartitions = Lists.newArrayList(currentKafkaPartitions);
         Collections.sort(sortedPartitions);
         dataSourceProperties.put("currentKafkaPartitions", Joiner.on(",").join(sortedPartitions));
@@ -792,6 +841,8 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
         dataSourceProperties.put("kafka_topic", topic);
         dataSourceProperties.put(KafkaDataSourceProperties.KAFKA_CONSUMER_TYPE,
                 useShareConsumer ? "share" : "standard");
+        dataSourceProperties.put(KafkaDataSourceProperties.KAFKA_SHARE_GUARDED_COMMIT,
+                String.valueOf(kafkaSourceGuardVersion > 0));
         return dataSourceProperties;
     }
 
@@ -804,6 +855,16 @@ public class KafkaRoutineLoadJob extends RoutineLoadJob {
     public void modifyProperties(AlterRoutineLoadCommand command) throws UserException {
         Map<String, String> jobProperties = command.getAnalyzedJobProperties();
         KafkaDataSourceProperties dataSourceProperties = (KafkaDataSourceProperties) command.getDataSourceProperties();
+        if (kafkaSourceGuardVersion > 0 && ((jobProperties.containsKey(CreateRoutineLoadInfo.STRICT_MODE)
+                && !Boolean.parseBoolean(jobProperties.get(CreateRoutineLoadInfo.STRICT_MODE)))
+                || (jobProperties.containsKey(CreateRoutineLoadInfo.MAX_ERROR_NUMBER_PROPERTY)
+                && Long.parseLong(jobProperties.get(CreateRoutineLoadInfo.MAX_ERROR_NUMBER_PROPERTY)) != 0)
+                || (jobProperties.containsKey(CreateRoutineLoadInfo.MAX_FILTER_RATIO_PROPERTY)
+                && Double.parseDouble(jobProperties.get(CreateRoutineLoadInfo.MAX_FILTER_RATIO_PROPERTY)) != 0)
+                || (command.getRoutineLoadDesc() != null && (command.getRoutineLoadDesc().getFilter() != null
+                || command.getRoutineLoadDesc().getPrecedingFilter() != null)))) {
+            throw new DdlException("Guarded Kafka share commit quality settings cannot be relaxed");
+        }
         if (useShareConsumer && dataSourceProperties != null
                 && MapUtils.isNotEmpty(dataSourceProperties.getOriginalDataSourceProperties())) {
             throw new DdlException("Share consumer source properties cannot be altered; create a new job");

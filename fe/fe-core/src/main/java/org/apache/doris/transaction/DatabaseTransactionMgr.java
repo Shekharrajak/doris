@@ -56,9 +56,11 @@ import org.apache.doris.common.util.InternalDatabaseUtil;
 import org.apache.doris.common.util.MetaLockUtils;
 import org.apache.doris.event.DataChangeEvent;
 import org.apache.doris.load.routineload.RLTaskTxnCommitAttachment;
+import org.apache.doris.load.routineload.RoutineLoadJob;
 import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionIndex.CapacityExceededException;
 import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionLedger;
 import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionLedger.Reservation;
+import org.apache.doris.load.routineload.kafka.KafkaSourceCompletionLedger.SourceConflictException;
 import org.apache.doris.load.routineload.kafka.KafkaSourceDescriptor;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.mtmv.MTMVUtil;
@@ -358,6 +360,21 @@ public class DatabaseTransactionMgr {
         Preconditions.checkNotNull(label);
         FeNameFormat.checkLabel(label);
 
+        int kafkaSourceGuardVersion = 0;
+        if (sourceType == TransactionState.LoadJobSourceType.ROUTINE_LOAD_TASK) {
+            RoutineLoadJob job = env.getRoutineLoadManager().getJob(listenerId);
+            if (job != null) {
+                kafkaSourceGuardVersion = job.getKafkaSourceGuardVersion();
+                if (kafkaSourceGuardVersion != 0 && (kafkaSourceGuardVersion != 1
+                        || !Config.enable_kafka_source_completion_tracking || Config.isCloudMode() || job.isMultiTable()
+                        || job.getDbId() != dbId || tableIdList.size() != 1
+                        || tableIdList.get(0) != job.getTableId())) {
+                    throw new BeginTransactionException("PAUSE: Guarded Kafka source job requires tracking and "
+                            + "its single-table transaction");
+                }
+            }
+        }
+
         long tid = 0L;
         TransactionState transactionState = null;
         EditLog.EditLogItem logItem = null;
@@ -400,6 +417,7 @@ public class DatabaseTransactionMgr {
             tid = idGenerator.getNextTransactionId();
             transactionState = new TransactionState(dbId, tableIdList,
                     tid, label, requestId, sourceType, coordinator, listenerId, timeoutSecond * 1000);
+            transactionState.requireKafkaSourceGuardVersion(kafkaSourceGuardVersion);
             transactionState.setPrepareTime(System.currentTimeMillis());
             unprotectUpdateInMemoryState(transactionState, false);
             updateTxnLabels(transactionState);
@@ -894,7 +912,8 @@ public class DatabaseTransactionMgr {
 
     private void rejectKafkaSourceCommitRoute(TransactionState transactionState, TxnCommitAttachment attachment,
             String route) throws TransactionCommitFailedException {
-        if ((transactionState != null && transactionState.hasKafkaSourceDescriptor())
+        if ((transactionState != null && (transactionState.hasKafkaSourceDescriptor()
+                        || transactionState.getKafkaSourceGuardVersionRequired() != 0))
                 || (attachment instanceof RLTaskTxnCommitAttachment
                         && ((RLTaskTxnCommitAttachment) attachment).getKafkaSourceDescriptor() != null)) {
             throw new TransactionCommitFailedException("Kafka source-identified transactions do not support " + route);
@@ -972,13 +991,20 @@ public class DatabaseTransactionMgr {
                 if (!checkTransactionStatusBeforeCommit(transactionId, is2PC, transactionState)) {
                     alreadyCommitted = true;
                 } else {
-                    if (Config.enable_kafka_source_completion_tracking && transactionState.hasKafkaSourceDescriptor()) {
+                    if (transactionState.getKafkaSourceGuardVersionRequired() != 0
+                            || (Config.enable_kafka_source_completion_tracking
+                                    && transactionState.hasKafkaSourceDescriptor())) {
                         completionLedger = env.getKafkaSourceCompletionLedger();
                         try {
-                            completionReservation = completionLedger.reserve(transactionId,
-                                    transactionState.getKafkaSourceDescriptor());
-                        } catch (CapacityExceededException e) {
-                            throw new TransactionCommitFailedException(e.getMessage(), e);
+                            completionReservation = transactionState.getKafkaSourceGuardVersionRequired() != 0
+                                    ? completionLedger.reserveExclusive(transactionId,
+                                            transactionState.getKafkaSourceDescriptor())
+                                    : completionLedger.reserve(transactionId,
+                                            transactionState.getKafkaSourceDescriptor());
+                        } catch (CapacityExceededException | SourceConflictException e) {
+                            String prefix = transactionState.getKafkaSourceGuardVersionRequired() != 0
+                                    ? "PAUSE: Guarded Kafka source commit blocked: " : "";
+                            throw new TransactionCommitFailedException(prefix + e.getMessage(), e);
                         }
                     }
                     if (!is2PC) {

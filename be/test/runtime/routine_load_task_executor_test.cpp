@@ -59,12 +59,15 @@ extern TGetKafkaSourceCompletionsResult k_stream_load_source_completions_result;
 
 class TaskShareConsumer : public KafkaShareConsumer {
 public:
-    enum class BatchKind { PREFIX, ALL_DONE, MIXED_DONE_NEW };
+    enum class BatchKind { PREFIX, ALL_DONE, MIXED_DONE_NEW, EMPTY };
 
     BatchKind batch_kind = BatchKind::PREFIX;
     bool fail_consume = false;
     bool fail_pipeline = false;
     bool fail_ack = false;
+    bool append_row = true;
+    int64_t filtered_rows = 0;
+    int64_t unselected_rows = 0;
     int cancel_calls = 0;
     int acknowledgement_commits = 0;
     std::vector<std::tuple<int32_t, int64_t, bool>> acknowledgements;
@@ -76,23 +79,27 @@ public:
 
     Status consume(std::shared_ptr<StreamLoadContext> ctx) override {
         _ctx = ctx;
-        _batch.reserve(2);
-        _batch.add_record(0, 100);
-        _batch.add_record(1, 50);
-        if (batch_kind == BatchKind::ALL_DONE) {
-            _batch.mark_done(0);
-            _batch.mark_done(1);
-        } else if (batch_kind == BatchKind::MIXED_DONE_NEW) {
-            _batch.mark_done(0);
-            _batch.mark_appended(1);
-        } else {
-            _batch.mark_appended(0);
+        ctx->number_filtered_rows = filtered_rows;
+        ctx->number_unselected_rows = unselected_rows;
+        if (batch_kind != BatchKind::EMPTY) {
+            _batch.reserve(2);
+            _batch.add_record(0, 100);
+            _batch.add_record(1, 50);
+            if (batch_kind == BatchKind::ALL_DONE) {
+                _batch.mark_done(0);
+                _batch.mark_done(1);
+            } else if (batch_kind == BatchKind::MIXED_DONE_NEW) {
+                _batch.mark_done(0);
+                _batch.mark_appended(1);
+            } else {
+                _batch.mark_appended(0);
+            }
         }
         if (fail_consume) {
             return Status::InternalError("share consume failed");
         }
         auto pipe = std::static_pointer_cast<io::StreamLoadPipe>(ctx->body_sink);
-        if (batch_kind != BatchKind::ALL_DONE) {
+        if (append_row && batch_kind != BatchKind::ALL_DONE && batch_kind != BatchKind::EMPTY) {
             RETURN_IF_ERROR(pipe->append_with_line_delimiter("row", 3));
         }
         if (fail_pipeline) {
@@ -139,6 +146,7 @@ public:
     int commit_calls = 0;
     int rollback_calls = 0;
     int rollback_confirmations = 0;
+    std::vector<std::string> rollback_reasons;
 
     Status commit_txn(StreamLoadContext* ctx) override {
         ++commit_calls;
@@ -151,8 +159,9 @@ public:
         return commit_result;
     }
 
-    void rollback_txn(StreamLoadContext*) override {
+    void rollback_txn(StreamLoadContext* ctx) override {
         ++rollback_calls;
+        rollback_reasons.push_back(ctx->status.to_string());
         _events->emplace_back(lose_rollback_response ? "rollback_lost" : "rollback");
         if (!lose_rollback_response) {
             ++rollback_confirmations;
@@ -174,7 +183,7 @@ public:
     RecordingStreamLoadExecutor* _stream_executor = nullptr;
     size_t _pooled_consumers = 0;
 
-    void run_share_task(TStatusCode::type commit_status) {
+    void run_share_task(TStatusCode::type commit_status, int32_t guard_version = 0) {
         TKafkaLoadInfo info;
         info.__set_use_share_consumer(true);
         _share_ctx = std::make_shared<StreamLoadContext>(_env);
@@ -186,6 +195,18 @@ public:
         _share_ctx->load_type = TLoadType::ROUTINE_LOAD;
         _share_ctx->load_src_type = TLoadSourceType::KAFKA;
         _share_ctx->kafka_info = std::make_unique<KafkaLoadInfo>(info);
+        _share_ctx->kafka_info->source_guard_version = guard_version;
+        if (guard_version != 0 &&
+            _share_consumer->batch_kind != TaskShareConsumer::BatchKind::ALL_DONE &&
+            _share_consumer->batch_kind != TaskShareConsumer::BatchKind::EMPTY) {
+            auto source = source_descriptor();
+            if (_share_consumer->batch_kind == TaskShareConsumer::BatchKind::MIXED_DONE_NEW) {
+                source.partitions[0].__set_partition(1);
+                source.partitions[0].ranges[0].__set_first(50);
+                source.partitions[0].ranges[0].__set_last(50);
+            }
+            _share_ctx->kafka_info->source_descriptor = std::move(source);
+        }
         _share_ctx->need_rollback = true;
         k_stream_load_commit_result.status.status_code = commit_status;
         if (_stream_executor != nullptr) {
@@ -332,6 +353,117 @@ TEST_F(RoutineLoadTaskExecutorTest, ShareAckFailureDoesNotReuseConsumerOrRollbac
     EXPECT_EQ(_share_consumer->acknowledgements,
               (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 100, true}, {1, 50, false}}));
     EXPECT_FALSE(_share_ctx->need_rollback);
+    EXPECT_EQ(_pooled_consumers, 0);
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, GuardedFilteredRowsAbortBeforeCommitAndKeepDurableDone) {
+    use_recording_executor();
+    _share_consumer->batch_kind = TaskShareConsumer::BatchKind::MIXED_DONE_NEW;
+    _share_consumer->filtered_rows = 1;
+    run_share_task(TStatusCode::OK, KafkaLoadInfo::SOURCE_GUARD_VERSION);
+    EXPECT_EQ(_stream_executor->commit_calls, 0);
+    EXPECT_EQ(_stream_executor->rollback_calls, 1);
+    EXPECT_NE(_share_ctx->status.to_string().find("PAUSE:"), std::string::npos);
+    EXPECT_EQ(_share_consumer->acknowledgements,
+              (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 100, true}, {1, 50, false}}));
+    EXPECT_EQ(_pooled_consumers, 0);
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, GuardedUnselectedRowsAbortEvenWithLoadedRows) {
+    use_recording_executor();
+    _share_consumer->unselected_rows = 1;
+    run_share_task(TStatusCode::OK, KafkaLoadInfo::SOURCE_GUARD_VERSION);
+    EXPECT_EQ(_share_ctx->number_loaded_rows, 1);
+    EXPECT_EQ(_stream_executor->commit_calls, 0);
+    EXPECT_EQ(_stream_executor->rollback_calls, 1);
+    EXPECT_NE(_share_ctx->status.to_string().find("PAUSE:"), std::string::npos);
+    EXPECT_EQ(_share_consumer->acknowledgements,
+              (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 100, false}, {1, 50, false}}));
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, GuardedAllUnselectedRowsAbortBeforeCommit) {
+    use_recording_executor();
+    _share_consumer->unselected_rows = 1;
+    _share_consumer->append_row = false;
+    run_share_task(TStatusCode::OK, KafkaLoadInfo::SOURCE_GUARD_VERSION);
+    EXPECT_EQ(_share_ctx->number_loaded_rows, 0);
+    EXPECT_EQ(_stream_executor->commit_calls, 0);
+    EXPECT_EQ(_stream_executor->rollback_calls, 1);
+    EXPECT_NE(_share_ctx->status.to_string().find("PAUSE:"), std::string::npos);
+    EXPECT_EQ(_share_consumer->acknowledgements,
+              (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 100, false}, {1, 50, false}}));
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, GuardedNonemptySourceWithZeroOutputAbortsBeforeCommit) {
+    use_recording_executor();
+    _share_consumer->append_row = false;
+    run_share_task(TStatusCode::OK, KafkaLoadInfo::SOURCE_GUARD_VERSION);
+    ASSERT_TRUE(_share_ctx->kafka_info->source_descriptor.has_value());
+    EXPECT_EQ(_share_ctx->number_loaded_rows, 0);
+    EXPECT_EQ(_stream_executor->commit_calls, 0);
+    EXPECT_EQ(_stream_executor->rollback_calls, 1);
+    EXPECT_NE(_share_ctx->status.to_string().find("PAUSE:"), std::string::npos);
+    EXPECT_EQ(_share_consumer->acknowledgements,
+              (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 100, false}, {1, 50, false}}));
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, GuardedEmptyAcquisitionRetiresUnusedTransactionAndReuses) {
+    use_recording_executor();
+    _share_consumer->batch_kind = TaskShareConsumer::BatchKind::EMPTY;
+    run_share_task(TStatusCode::INTERNAL_ERROR, KafkaLoadInfo::SOURCE_GUARD_VERSION);
+    EXPECT_EQ(_stream_executor->commit_calls, 0);
+    EXPECT_EQ(_stream_executor->rollback_calls, 1);
+    EXPECT_FALSE(_share_ctx->need_rollback);
+    EXPECT_TRUE(_share_ctx->status.ok());
+    EXPECT_TRUE(_share_consumer->acknowledgements.empty());
+    EXPECT_EQ(_share_consumer->acknowledgement_commits, 0);
+    EXPECT_EQ(_pooled_consumers, 1);
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, OrdinaryEmptyAcquisitionKeepsExistingCommitPath) {
+    use_recording_executor();
+    _share_consumer->batch_kind = TaskShareConsumer::BatchKind::EMPTY;
+    run_share_task(TStatusCode::OK);
+    EXPECT_EQ(_stream_executor->commit_calls, 1);
+    EXPECT_EQ(_stream_executor->rollback_calls, 0);
+    EXPECT_TRUE(_share_consumer->acknowledgements.empty());
+    EXPECT_EQ(_pooled_consumers, 1);
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, OrdinaryFilteredRowsKeepExistingCommitPath) {
+    use_recording_executor();
+    _share_consumer->filtered_rows = 1;
+    run_share_task(TStatusCode::OK);
+    EXPECT_EQ(_stream_executor->commit_calls, 1);
+    EXPECT_EQ(_stream_executor->rollback_calls, 0);
+    EXPECT_EQ(_share_consumer->acknowledgements,
+              (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 100, true}, {1, 50, false}}));
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, GuardedConsumeFailureRequestsPauseBeforeRollback) {
+    use_recording_executor();
+    _share_consumer->fail_consume = true;
+    run_share_task(TStatusCode::OK, KafkaLoadInfo::SOURCE_GUARD_VERSION);
+    EXPECT_EQ(_stream_executor->commit_calls, 0);
+    EXPECT_EQ(_stream_executor->rollback_calls, 1);
+    ASSERT_EQ(_stream_executor->rollback_reasons.size(), 1);
+    EXPECT_NE(_stream_executor->rollback_reasons[0].find("PAUSE: Guarded Kafka share task failed"),
+              std::string::npos);
+    EXPECT_NE(_share_ctx->status.to_string().find("PAUSE: Guarded Kafka share task failed"),
+              std::string::npos);
+    EXPECT_EQ(_share_consumer->acknowledgements,
+              (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 100, false}, {1, 50, false}}));
+}
+
+TEST_F(RoutineLoadTaskExecutorTest, GuardedCommittedAckFailureDoesNotRollbackOrReuse) {
+    use_recording_executor();
+    _share_consumer->fail_ack = true;
+    run_share_task(TStatusCode::OK, KafkaLoadInfo::SOURCE_GUARD_VERSION);
+    EXPECT_EQ(_stream_executor->commit_calls, 1);
+    EXPECT_EQ(_stream_executor->rollback_calls, 0);
+    EXPECT_FALSE(_share_ctx->need_rollback);
+    EXPECT_EQ(_share_consumer->acknowledgements,
+              (std::vector<std::tuple<int32_t, int64_t, bool>> {{0, 100, true}, {1, 50, false}}));
     EXPECT_EQ(_pooled_consumers, 0);
 }
 

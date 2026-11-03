@@ -17,6 +17,7 @@
 
 package org.apache.doris.load.routineload;
 
+import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.Separator;
 import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Database;
@@ -26,12 +27,15 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.info.PartitionNamesInfo;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.InternalErrorCode;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.kafka.KafkaUtil;
+import org.apache.doris.datasource.property.fileformat.CsvFileFormatProperties;
 import org.apache.doris.load.RoutineLoadDesc;
 import org.apache.doris.load.loadv2.LoadTask;
 import org.apache.doris.load.routineload.kafka.KafkaConfiguration;
@@ -40,17 +44,28 @@ import org.apache.doris.load.routineload.kafka.KafkaProgress;
 import org.apache.doris.load.routineload.kafka.KafkaRoutineLoadJob;
 import org.apache.doris.load.routineload.kafka.KafkaTaskInfo;
 import org.apache.doris.mysql.privilege.MockedAuth;
+import org.apache.doris.nereids.parser.NereidsParser;
+import org.apache.doris.nereids.trees.plans.commands.AlterRoutineLoadCommand;
 import org.apache.doris.nereids.trees.plans.commands.info.CreateRoutineLoadInfo;
 import org.apache.doris.nereids.trees.plans.commands.info.LabelNameInfo;
+import org.apache.doris.nereids.trees.plans.commands.load.CreateRoutineLoadCommand;
 import org.apache.doris.nereids.trees.plans.commands.load.LoadProperty;
 import org.apache.doris.nereids.trees.plans.commands.load.LoadSeparator;
+import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.thrift.TResourceInfo;
 import org.apache.doris.thrift.TRoutineLoadTask;
+import org.apache.doris.thrift.TUniqueKeyUpdateMode;
+import org.apache.doris.transaction.TransactionState;
+import org.apache.doris.transaction.TransactionStatus;
 
 import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -58,6 +73,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedConstruction;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
@@ -66,10 +82,15 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 public class KafkaRoutineLoadJobTest {
     private static final Logger LOG = LogManager.getLogger(KafkaRoutineLoadJobTest.class);
+    private static final String GUARDED_CREATE_SQL = "CREATE ROUTINE LOAD guarded ON events "
+            + "PROPERTIES(\"strict_mode\"=\"true\",\"max_error_number\"=\"0\",\"max_filter_ratio\"=\"0\") "
+            + "FROM KAFKA(\"kafka_broker_list\"=\"localhost:9092\",\"kafka_topic\"=\"events\","
+            + "\"kafka_consumer_type\"=\"share\",\"kafka_share_guarded_commit\"=\"true\")";
 
     private String jobName = "job1";
     private String dbName = "db1";
@@ -125,6 +146,255 @@ public class KafkaRoutineLoadJobTest {
         } finally {
             Config.max_routine_load_task_concurrent_num = originalLimit;
         }
+    }
+
+    @Test
+    public void testGuardedCreationRequiresTrackingAndZeroLossQuality() throws Exception {
+        boolean previousTracking = Config.enable_kafka_source_completion_tracking;
+        String previousMode = Config.deploy_mode;
+        String previousCloud = Config.cloud_unique_id;
+        try (MockedStatic<Env> envStatic = Mockito.mockStatic(Env.class)) {
+            envStatic.when(Env::getCurrentEnv).thenReturn(Mockito.mock(Env.class));
+            Config.deploy_mode = "local";
+            Config.cloud_unique_id = "";
+            Config.enable_kafka_source_completion_tracking = false;
+            Assertions.assertThrows(UserException.class,
+                    () -> new GuardedCreationJob().configure(guardedCreateInfo()));
+            Config.enable_kafka_source_completion_tracking = true;
+            GuardedCreationJob job = new GuardedCreationJob();
+            job.configure(guardedCreateInfo());
+            Assertions.assertEquals(1, job.getKafkaSourceGuardVersion());
+            Assertions.assertEquals("true", job.getDataSourceProperties()
+                    .get(KafkaDataSourceProperties.KAFKA_SHARE_GUARDED_COMMIT));
+
+            for (int invalid = 0; invalid < 5; ++invalid) {
+                CreateRoutineLoadInfo info = guardedCreateInfo();
+                if (invalid == 0) {
+                    Mockito.when(info.isStrictMode()).thenReturn(false);
+                } else if (invalid == 1) {
+                    Mockito.when(info.getMaxErrorNum()).thenReturn(1L);
+                } else if (invalid == 2) {
+                    Mockito.when(info.getMaxFilterRatio()).thenReturn(1.0);
+                } else {
+                    RoutineLoadDesc desc = Mockito.mock(RoutineLoadDesc.class);
+                    if (invalid == 3) {
+                        Mockito.when(desc.getFilter()).thenReturn(Mockito.mock(Expr.class));
+                    } else {
+                        Mockito.when(desc.getPrecedingFilter())
+                                .thenReturn(Mockito.mock(Expr.class));
+                    }
+                    Mockito.when(info.getRoutineLoadDesc()).thenReturn(desc);
+                }
+                Assertions.assertThrows(UserException.class, () -> new GuardedCreationJob().configure(info));
+            }
+            Config.cloud_unique_id = "cloud";
+            Assertions.assertThrows(UserException.class,
+                    () -> new GuardedCreationJob().configure(guardedCreateInfo()));
+        } finally {
+            Config.enable_kafka_source_completion_tracking = previousTracking;
+            Config.deploy_mode = previousMode;
+            Config.cloud_unique_id = previousCloud;
+        }
+    }
+
+    @Test
+    public void testGuardedModeReplayRemainsExplicitAndIgnoresCurrentTrackingConfig() throws Exception {
+        boolean previous = Config.enable_kafka_source_completion_tracking;
+        String previousMode = Config.deploy_mode;
+        String previousCloud = Config.cloud_unique_id;
+        Env env = replayEnv();
+        CreateRoutineLoadInfo info = guardedCreateInfo();
+        CreateRoutineLoadCommand command = Mockito.mock(CreateRoutineLoadCommand.class);
+        Mockito.when(command.getCreateRoutineLoadInfo()).thenReturn(info);
+        try (MockedStatic<Env> envStatic = Mockito.mockStatic(Env.class);
+                MockedConstruction<NereidsParser> ignored = Mockito.mockConstruction(NereidsParser.class,
+                        (parser, context) -> Mockito.when(parser.parseSingle(Mockito.anyString())).thenReturn(command))) {
+            envStatic.when(Env::getCurrentEnv).thenReturn(env);
+            Config.deploy_mode = "local";
+            Config.cloud_unique_id = "";
+            Config.enable_kafka_source_completion_tracking = true;
+            KafkaRoutineLoadJob job = new KafkaRoutineLoadJob(1L, "guarded", 1L, 1L,
+                    "localhost:9092", "events", UserIdentity.ADMIN);
+            job.setOrigStmt(new OriginStatement(GUARDED_CREATE_SQL, 0));
+            Deencapsulation.invoke(job, "setOptional", info);
+            JsonObject json = JsonParser.parseString(GsonUtils.GSON.toJson(job)).getAsJsonObject();
+            Assertions.assertEquals("KafkaRoutineLoadJob", json.get("clazz").getAsString());
+            Config.enable_kafka_source_completion_tracking = false;
+            KafkaRoutineLoadJob restored = GsonUtils.GSON.fromJson(json.toString(), KafkaRoutineLoadJob.class);
+            Assertions.assertEquals(1, restored.getKafkaSourceGuardVersion());
+            Assertions.assertEquals(RoutineLoadJob.JobState.NEED_SCHEDULE, restored.getState());
+            Assertions.assertEquals(0.0, (Double) Deencapsulation.getField(restored, "maxFilterRatio"));
+            json.remove("kafkaSourceGuardVersion");
+            KafkaRoutineLoadJob missingMode = GsonUtils.GSON.fromJson(json.toString(), KafkaRoutineLoadJob.class);
+            Assertions.assertEquals(0, missingMode.getKafkaSourceGuardVersion());
+            Assertions.assertEquals(RoutineLoadJob.JobState.CANCELLED, missingMode.getState());
+            json.addProperty("kafkaSourceGuardVersion", 2);
+            Assertions.assertThrows(JsonParseException.class,
+                    () -> GsonUtils.GSON.fromJson(json.toString(), KafkaRoutineLoadJob.class));
+            json.addProperty("kafkaSourceGuardVersion", 1);
+            json.addProperty("useShareConsumer", false);
+            Assertions.assertThrows(JsonParseException.class,
+                    () -> GsonUtils.GSON.fromJson(json.toString(), KafkaRoutineLoadJob.class));
+        } finally {
+            Config.enable_kafka_source_completion_tracking = previous;
+            Config.deploy_mode = previousMode;
+            Config.cloud_unique_id = previousCloud;
+        }
+    }
+
+    @Test
+    public void testGuardedAlterCannotRelaxQualityOrChangeSource() throws Exception {
+        GuardedCreationJob job = new GuardedCreationJob();
+        Deencapsulation.setField(job, "useShareConsumer", true);
+        Deencapsulation.setField(job, "kafkaSourceGuardVersion", 1);
+        for (Map<String, String> properties : Arrays.asList(
+                Map.of(CreateRoutineLoadInfo.STRICT_MODE, "false"),
+                Map.of(CreateRoutineLoadInfo.MAX_ERROR_NUMBER_PROPERTY, "1"),
+                Map.of(CreateRoutineLoadInfo.MAX_FILTER_RATIO_PROPERTY, "0.1"))) {
+            AlterRoutineLoadCommand command = Mockito.mock(AlterRoutineLoadCommand.class);
+            Mockito.when(command.getAnalyzedJobProperties()).thenReturn(properties);
+            Assertions.assertThrows(UserException.class, () -> job.modifyProperties(command));
+        }
+        AlterRoutineLoadCommand command = Mockito.mock(AlterRoutineLoadCommand.class);
+        Mockito.when(command.getAnalyzedJobProperties()).thenReturn(Map.of());
+        Mockito.when(command.getDataSourceProperties()).thenReturn(new KafkaDataSourceProperties(
+                Map.of(KafkaDataSourceProperties.KAFKA_SHARE_GUARDED_COMMIT, "false")));
+        Assertions.assertThrows(UserException.class, () -> job.modifyProperties(command));
+        for (boolean preceding : new boolean[] {false, true}) {
+            RoutineLoadDesc desc = Mockito.mock(RoutineLoadDesc.class);
+            if (preceding) {
+                Mockito.when(desc.getPrecedingFilter()).thenReturn(Mockito.mock(Expr.class));
+            } else {
+                Mockito.when(desc.getFilter()).thenReturn(Mockito.mock(Expr.class));
+            }
+            AlterRoutineLoadCommand filter = Mockito.mock(AlterRoutineLoadCommand.class);
+            Mockito.when(filter.getAnalyzedJobProperties()).thenReturn(Map.of());
+            Mockito.when(filter.getRoutineLoadDesc()).thenReturn(desc);
+            Assertions.assertThrows(UserException.class, () -> job.modifyProperties(filter));
+        }
+    }
+
+    @Test
+    public void testReplayedCreateCannotPromoteMissingPersistedMode() throws Exception {
+        Env env = replayEnv();
+        try (MockedStatic<Env> envStatic = Mockito.mockStatic(Env.class)) {
+            envStatic.when(Env::getCurrentEnv).thenReturn(env);
+            for (boolean guarded : new boolean[] {false, true}) {
+                CreateRoutineLoadInfo info = guardedCreateInfo();
+                if (!guarded) {
+                    KafkaDataSourceProperties legacy = new KafkaDataSourceProperties(Map.of(
+                            "kafka_broker_list", "localhost:9092", "kafka_topic", "events"));
+                    legacy.convertAndCheckDataSourceProperties();
+                    Mockito.when(info.getDataSourceProperties()).thenReturn(legacy);
+                }
+                CreateRoutineLoadCommand command = Mockito.mock(CreateRoutineLoadCommand.class);
+                Mockito.when(command.getCreateRoutineLoadInfo()).thenReturn(info);
+                try (MockedConstruction<NereidsParser> ignored = Mockito.mockConstruction(NereidsParser.class,
+                        (parser, context) -> Mockito.when(parser.parseSingle(Mockito.anyString()))
+                                .thenReturn(command))) {
+                    GuardedCreationJob job = new GuardedCreationJob();
+                    Deencapsulation.setField(job, "state", RoutineLoadJob.JobState.RUNNING);
+                    job.gsonPostProcess();
+                    Assertions.assertEquals(0, job.getKafkaSourceGuardVersion());
+                    Assertions.assertEquals(guarded ? RoutineLoadJob.JobState.CANCELLED
+                            : RoutineLoadJob.JobState.RUNNING, job.getState());
+                    Mockito.verify(info).validate(Mockito.any(ConnectContext.class));
+                    Mockito.verify(info).getDataSourceProperties();
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testGuardedPauseRequiresManualResume() {
+        GuardedCreationJob job = new GuardedCreationJob();
+        Deencapsulation.setField(job, "state", RoutineLoadJob.JobState.PAUSED);
+        Deencapsulation.setField(job, "pauseReason",
+                new ErrorReason(InternalErrorCode.CREATE_TASKS_ERR, "guarded submit failed"));
+        Deencapsulation.setField(job, "kafkaSourceGuardVersion", 1);
+        boolean guardedResume = Deencapsulation.invoke(job, "needAutoResume");
+        Assertions.assertFalse(guardedResume);
+        Assertions.assertEquals(0L, (Long) Deencapsulation.getField(job, "latestResumeTimestamp"));
+        Deencapsulation.setField(job, "kafkaSourceGuardVersion", 0);
+        boolean legacyResume = Deencapsulation.invoke(job, "needAutoResume");
+        Assertions.assertTrue(legacyResume);
+    }
+
+    @Test
+    public void testGuardedAbortPauseMarkerTakesPriorityOverNestedTimeout() throws Exception {
+        String reason = "[INTERNAL_ERROR] PAUSE: Guarded Kafka share task failed: [TIMEOUT] load timed out";
+        Assertions.assertEquals(TransactionState.TxnStatusChangeReason.TIMEOUT,
+                TransactionState.TxnStatusChangeReason.fromString(reason));
+        Env env = Mockito.mock(Env.class);
+        RoutineLoadTaskScheduler scheduler = Mockito.mock(RoutineLoadTaskScheduler.class);
+        Mockito.when(env.getEditLog()).thenReturn(Mockito.mock(org.apache.doris.persist.EditLog.class));
+        Mockito.when(env.getRoutineLoadTaskScheduler()).thenReturn(scheduler);
+        try (MockedStatic<Env> envStatic = Mockito.mockStatic(Env.class)) {
+            envStatic.when(Env::getCurrentEnv).thenReturn(env);
+            GuardedCreationJob job = new GuardedCreationJob();
+            Deencapsulation.setField(job, "useShareConsumer", true);
+            Deencapsulation.setField(job, "kafkaSourceGuardVersion", 1);
+            Deencapsulation.setField(job, "state", RoutineLoadJob.JobState.RUNNING);
+            KafkaTaskInfo task = new KafkaTaskInfo(UUID.randomUUID(), 1L, 20000,
+                    Maps.newHashMap(), false, -1, false);
+            Deencapsulation.setField(task, "txnId", 7L);
+            Deencapsulation.setField(job, "routineLoadTaskInfoList", Lists.newArrayList(task));
+            TransactionState transaction = new TransactionState();
+            Deencapsulation.setField(transaction, "transactionId", 7L);
+            job.beforeAborted(transaction);
+            transaction.setTransactionStatus(TransactionStatus.ABORTED);
+            job.afterAborted(transaction, true, reason);
+            Assertions.assertEquals(RoutineLoadJob.JobState.PAUSED, job.getState());
+            Assertions.assertEquals(InternalErrorCode.CANNOT_RESUME_ERR, job.getPauseReason().getCode());
+            List<RoutineLoadTaskInfo> remaining = Deencapsulation.getField(job, "routineLoadTaskInfoList");
+            Assertions.assertTrue(remaining.isEmpty());
+            Mockito.verifyNoInteractions(scheduler);
+        }
+    }
+
+    private CreateRoutineLoadInfo guardedCreateInfo() throws UserException {
+        Map<String, String> source = new HashMap<>();
+        source.put("kafka_broker_list", "localhost:9092");
+        source.put("kafka_topic", "events");
+        source.put(KafkaDataSourceProperties.KAFKA_CONSUMER_TYPE, "share");
+        source.put(KafkaDataSourceProperties.KAFKA_SHARE_GUARDED_COMMIT, "true");
+        KafkaDataSourceProperties properties = new KafkaDataSourceProperties(source);
+        properties.convertAndCheckDataSourceProperties();
+        CreateRoutineLoadInfo info = Mockito.mock(CreateRoutineLoadInfo.class);
+        Mockito.when(info.getDataSourceProperties()).thenReturn(properties);
+        Mockito.when(info.getFileFormatProperties()).thenReturn(new CsvFileFormatProperties("csv"));
+        Mockito.when(info.getUniqueKeyUpdateMode()).thenReturn(TUniqueKeyUpdateMode.UPSERT);
+        Mockito.when(info.getTimezone()).thenReturn("UTC");
+        Mockito.when(info.isStrictMode()).thenReturn(true);
+        return info;
+    }
+
+    private Env replayEnv() {
+        Env env = Mockito.mock(Env.class);
+        InternalCatalog catalog = Mockito.mock(InternalCatalog.class);
+        CatalogMgr catalogMgr = Mockito.mock(CatalogMgr.class);
+        Database database = Mockito.mock(Database.class);
+        Mockito.when(env.getInternalCatalog()).thenReturn(catalog);
+        Mockito.when(env.getCatalogMgr()).thenReturn(catalogMgr);
+        Mockito.when(catalog.getName()).thenReturn("internal");
+        Mockito.when(catalogMgr.getCatalog(Mockito.anyString())).thenReturn(catalog);
+        Mockito.when(catalog.getDb(1L)).thenReturn(Optional.of(database));
+        Mockito.when(catalog.getDb("db1")).thenReturn(Optional.of(database));
+        Mockito.when(database.getName()).thenReturn("db1");
+        Mockito.when(database.getId()).thenReturn(1L);
+        return env;
+    }
+
+    private static class GuardedCreationJob extends KafkaRoutineLoadJob {
+        GuardedCreationJob() {
+            super(1L, "guarded", 1L, 1L, "localhost:9092", "events", UserIdentity.ADMIN);
+            setOrigStmt(new OriginStatement(GUARDED_CREATE_SQL, 0));
+        }
+
+        void configure(CreateRoutineLoadInfo info) throws UserException {
+            setOptional(info);
+        }
+
     }
 
     @Test

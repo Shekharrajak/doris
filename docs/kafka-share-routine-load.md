@@ -84,6 +84,42 @@ are released for retry; there is no automatic DLQ. Missing completion history st
 unknown. Concurrent transactions can still write the same unknown records, so this
 option does not provide exactly-once ingestion.
 
+## Experimental guarded commits
+
+After upgrading all FEs and BEs, enable FE completion tracking and BE
+completion filtering as described above. Do not downgrade FEs while guarded jobs
+exist. Create a fresh job with an intentional source-start and destination boundary;
+completion history does not deduplicate writes from earlier jobs.
+
+```sql
+CREATE ROUTINE LOAD events_guarded ON events
+PROPERTIES (
+    "strict_mode" = "true",
+    "max_error_number" = "0",
+    "max_filter_ratio" = "0"
+)
+FROM KAFKA (
+    "kafka_broker_list" = "kafka:9092",
+    "kafka_topic" = "events",
+    "kafka_consumer_type" = "share",
+    "kafka_share_guarded_commit" = "true",
+    "property.group.id" = "doris-events-guarded"
+);
+```
+
+This creation-only mode rejects overlapping source records before commit. It
+requires a supported BE, strict parsing, zero error limits and no WHERE or
+PRECEDING FILTER. Failed submissions, load failures and commit conflicts pause
+the job. Diagnose the transaction outcome before resuming; uncertain commits keep
+their ownership until recovery establishes the durable result. Empty polls retire
+their unused transaction and continue normally.
+
+Guarding follows Doris format semantics; a Kafka message need not produce exactly
+one row. Blank or empty-array inputs can be parser no-ops, including in mixed
+batches. There is no automatic DLQ. Broker retention and delivery-attempt limits
+still bound recovery. Native failure-campaign validation remains pending; this is
+not a production exactly-once guarantee.
+
 ## Kafka trunk regression
 
 Use a disposable non-cloud Doris cluster with debug points enabled, a Kafka trunk
