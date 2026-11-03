@@ -159,7 +159,7 @@ and the containers.
 
 ```bash
 ./run-regression-test.sh --run -d load_p0/routine_load \
-    -s test_kafka_share_guarded_recovery -image <guarded-doris-image>
+    -s test_kafka_share_guarded_recovery -dockerSuiteParallel 1 -image <guarded-doris-image>
 ```
 
 Each fault uses a fresh non-cloud cluster with tracking, filtering and debug

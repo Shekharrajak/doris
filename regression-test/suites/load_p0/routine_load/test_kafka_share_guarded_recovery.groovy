@@ -28,7 +28,7 @@ import java.time.Duration
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 
-suite("test_kafka_share_guarded_recovery", "kafka_share,docker,nonConcurrent") {
+suite("test_kafka_share_guarded_recovery", "kafka_share,docker") {
     String enabled = context.config.otherConfigs.get("enableKafkaShareGuardedTest")
     if (enabled == null || enabled.equalsIgnoreCase("false")) {
         logger.info("Skipping guarded Kafka recovery: enableKafkaShareGuardedTest is not true")
